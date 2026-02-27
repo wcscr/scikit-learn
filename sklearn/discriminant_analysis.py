@@ -23,7 +23,11 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.utils._array_api import _expit, device, get_namespace, size
 from sklearn.utils._param_validation import HasMethods, Interval, StrOptions
 from sklearn.utils.extmath import softmax
-from sklearn.utils.multiclass import check_classification_targets, unique_labels
+from sklearn.utils.multiclass import (
+    _check_partial_fit_first_call,
+    check_classification_targets,
+    unique_labels,
+)
 from sklearn.utils.validation import check_is_fitted, validate_data
 
 __all__ = ["LinearDiscriminantAnalysis", "QuadraticDiscriminantAnalysis"]
@@ -487,7 +491,17 @@ class LinearDiscriminantAnalysis(
         self.covariance_ = _class_cov(
             X, y, self.priors_, shrinkage, covariance_estimator
         )
-        self.coef_ = linalg.lstsq(self.covariance_, self.means_.T)[0].T
+        self._solve_lsqr_from_covariance(self.covariance_)
+
+    def _solve_lsqr_from_covariance(self, covariance):
+        """Compute coef_ and intercept_ from a precomputed covariance matrix.
+
+        Parameters
+        ----------
+        covariance : ndarray of shape (n_features, n_features)
+            The within-class covariance matrix.
+        """
+        self.coef_ = linalg.lstsq(covariance, self.means_.T)[0].T
         self.intercept_ = -0.5 * np.diag(np.dot(self.means_, self.coef_.T)) + np.log(
             self.priors_
         )
@@ -546,6 +560,19 @@ class LinearDiscriminantAnalysis(
         St = _cov(X, shrinkage, covariance_estimator)  # total scatter
         Sb = St - Sw  # between scatter
 
+        self._solve_eigen_from_matrices(Sb, Sw)
+
+    def _solve_eigen_from_matrices(self, Sb, Sw):
+        """Solve the generalized eigenvalue problem given scatter matrices.
+
+        Parameters
+        ----------
+        Sb : ndarray of shape (n_features, n_features)
+            Between-class scatter matrix.
+
+        Sw : ndarray of shape (n_features, n_features)
+            Within-class scatter matrix.
+        """
         evals, evecs = linalg.eigh(Sb, Sw)
         self.explained_variance_ratio_ = np.sort(evals / np.sum(evals))[::-1][
             : self._max_components
@@ -726,6 +753,168 @@ class LinearDiscriminantAnalysis(
                 self.intercept_[1] - self.intercept_[0], dtype=X.dtype
             )
             self.intercept_ = xp.reshape(intercept_, (1,))
+        self._n_features_out = self._max_components
+        return self
+
+    @_fit_context(
+        # LinearDiscriminantAnalysis.covariance_estimator is not validated yet
+        prefer_skip_nested_validation=False
+    )
+    def partial_fit(self, X, y, classes=None):
+        """Incrementally fit the Linear Discriminant Analysis model.
+
+        This method allows online learning by updating sufficient statistics
+        with each new batch of data using Chan's parallel variance update
+        algorithm. The resulting model is mathematically equivalent to fitting
+        on all data at once.
+
+        .. versionadded:: 1.7
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data.
+
+        y : array-like of shape (n_samples,)
+            Target values.
+
+        classes : array-like of shape (n_classes,), default=None
+            List of all classes that can possibly appear in the `y` vector.
+            Must be provided at the first call to ``partial_fit``, can be
+            omitted in subsequent calls.
+
+        Returns
+        -------
+        self : object
+            Fitted estimator.
+        """
+        if self.solver == "svd":
+            raise NotImplementedError(
+                "partial_fit does not support solver='svd'. "
+                "Use solver='eigen' or solver='lsqr'."
+            )
+        if self.shrinkage == "auto" or self.covariance_estimator is not None:
+            raise NotImplementedError(
+                "partial_fit does not support shrinkage='auto' or a custom "
+                "covariance_estimator. Use a float shrinkage value or None."
+            )
+
+        first_call = _check_partial_fit_first_call(self, classes)
+
+        X, y = validate_data(
+            self,
+            X,
+            y,
+            ensure_min_samples=1,
+            dtype=[np.float64, np.float32],
+            reset=first_call,
+        )
+
+        n_features = X.shape[1]
+        n_classes = len(self.classes_)
+
+        if first_call:
+            self._class_counts = np.zeros(n_classes, dtype=np.float64)
+            self.means_ = np.zeros((n_classes, n_features), dtype=np.float64)
+            self._unscaled_covariance = np.zeros(
+                (n_features, n_features), dtype=np.float64
+            )
+
+        # --- Chan's parallel variance update per class ---
+        for idx, c in enumerate(self.classes_):
+            X_k = X[y == c]
+            m_k = X_k.shape[0]
+            if m_k == 0:
+                continue
+
+            chunk_mean = np.mean(X_k, axis=0)
+            if m_k == 1:
+                S_chunk = np.zeros((n_features, n_features), dtype=np.float64)
+            else:
+                X_k_centered = X_k - chunk_mean
+                S_chunk = X_k_centered.T @ X_k_centered
+
+            N_k_old = self._class_counts[idx]
+            N_k_new = N_k_old + m_k
+            delta = chunk_mean - self.means_[idx]
+
+            self._unscaled_covariance += S_chunk + (
+                N_k_old * m_k / N_k_new
+            ) * np.outer(delta, delta)
+            self.means_[idx] += (m_k / N_k_new) * delta
+            self._class_counts[idx] = N_k_new
+
+        # --- Derive public parameters ---
+        N_total = self._class_counts.sum()
+        self.priors_ = self._class_counts / N_total
+
+        # Cannot solve until at least 2 classes have been observed and
+        # there are enough within-class degrees of freedom for a
+        # non-singular covariance matrix.
+        n_classes_seen = np.count_nonzero(self._class_counts)
+        within_df = N_total - n_classes_seen
+        if n_classes_seen < 2 or within_df < n_features:
+            return self
+
+        # Maximum number of components
+        max_components = min(n_classes - 1, n_features)
+        if self.n_components is None:
+            self._max_components = max_components
+        else:
+            if self.n_components > max_components:
+                raise ValueError(
+                    "n_components cannot be larger than "
+                    "min(n_features, n_classes - 1)."
+                )
+            self._max_components = self.n_components
+
+        covariance = self._unscaled_covariance / N_total
+
+        # Apply explicit float shrinkage
+        if self.shrinkage is not None:
+            covariance = shrunk_covariance(covariance, self.shrinkage)
+
+        self.covariance_ = covariance
+
+        if self.solver == "eigen":
+            # Reconstruct between-class scatter
+            mu_global = np.average(
+                self.means_, axis=0, weights=self._class_counts
+            )
+            Sb = sum(
+                self._class_counts[i]
+                * np.outer(
+                    self.means_[i] - mu_global, self.means_[i] - mu_global
+                )
+                for i in range(n_classes)
+            ) / N_total
+
+            if self.shrinkage is not None:
+                St = shrunk_covariance(
+                    (self._unscaled_covariance
+                     + sum(
+                         self._class_counts[i]
+                         * np.outer(
+                             self.means_[i] - mu_global,
+                             self.means_[i] - mu_global,
+                         )
+                         for i in range(n_classes)
+                     )) / N_total,
+                    self.shrinkage,
+                )
+                Sb = St - covariance
+
+            self._solve_eigen_from_matrices(Sb=Sb, Sw=covariance)
+        elif self.solver == "lsqr":
+            self._solve_lsqr_from_covariance(covariance)
+
+        # Binary case: reduce to 1D output
+        if len(self.classes_) == 2:
+            self.coef_ = (self.coef_[1, :] - self.coef_[0, :])[np.newaxis, :]
+            self.intercept_ = np.array(
+                [self.intercept_[1] - self.intercept_[0]]
+            )
+
         self._n_features_out = self._max_components
         return self
 
