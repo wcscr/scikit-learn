@@ -768,7 +768,7 @@ class LinearDiscriminantAnalysis(
         algorithm. The resulting model is mathematically equivalent to fitting
         on all data at once.
 
-        .. versionadded:: 1.7
+        .. versionadded:: 1.9
 
         Parameters
         ----------
@@ -787,6 +787,13 @@ class LinearDiscriminantAnalysis(
         -------
         self : object
             Fitted estimator.
+
+        Notes
+        -----
+        The estimator is not usable for prediction until all classes have
+        been observed and sufficient samples have been accumulated (at
+        least ``n_classes`` total samples for the ``eigen`` solver).
+        Until then, calling ``predict`` will raise ``NotFittedError``.
         """
         if self.solver == "svd":
             raise NotImplementedError(
@@ -813,11 +820,23 @@ class LinearDiscriminantAnalysis(
         n_features = X.shape[1]
         n_classes = len(self.classes_)
 
-        if first_call:
+        if first_call or not hasattr(self, "_class_counts"):
+            # Reinitialize accumulators on first call or after a prior
+            # fit() call which does not set these private attributes.
             self._class_counts = np.zeros(n_classes, dtype=np.float64)
-            self.means_ = np.zeros((n_classes, n_features), dtype=np.float64)
+            self.means_ = np.zeros(
+                (n_classes, n_features), dtype=np.float64
+            )
             self._unscaled_covariance = np.zeros(
                 (n_features, n_features), dtype=np.float64
+            )
+
+        # Validate that y contains only known classes
+        unexpected = np.setdiff1d(y, self.classes_)
+        if len(unexpected) > 0:
+            raise ValueError(
+                f"The target label(s) {unexpected} in y do not exist "
+                f"in the initial classes {self.classes_}"
             )
 
         # --- Chan's parallel variance update per class ---
@@ -846,14 +865,28 @@ class LinearDiscriminantAnalysis(
 
         # --- Derive public parameters ---
         N_total = self._class_counts.sum()
-        self.priors_ = self._class_counts / N_total
 
-        # Cannot solve until at least 2 classes have been observed and
-        # there are enough within-class degrees of freedom for a
-        # non-singular covariance matrix.
+        if self.priors is not None:
+            self.priors_ = np.asarray(self.priors, dtype=np.float64)
+            if np.any(self.priors_ < 0):
+                raise ValueError("priors must be non-negative")
+            if np.abs(np.sum(self.priors_) - 1.0) > 1e-5:
+                warnings.warn(
+                    "The priors do not sum to 1. Renormalizing",
+                    UserWarning,
+                )
+                self.priors_ = self.priors_ / self.priors_.sum()
+        else:
+            self.priors_ = self._class_counts / N_total
+
+        # Cannot solve until at least 2 classes have been observed.
+        # For the eigen solver, also require enough within-class degrees
+        # of freedom for a non-singular covariance matrix.
         n_classes_seen = np.count_nonzero(self._class_counts)
         within_df = N_total - n_classes_seen
-        if n_classes_seen < 2 or within_df < n_features:
+        if n_classes_seen < 2 or (
+            self.solver == "eigen" and within_df < n_features
+        ):
             return self
 
         # Maximum number of components

@@ -1,0 +1,4 @@
+- :class:`discriminant_analysis.LinearDiscriminantAnalysis` now supports
+  incremental learning via :meth:`partial_fit` using Chan's parallel variance
+  update algorithm, for the ``"eigen"`` and ``"lsqr"`` solvers.
+  By :user:`Will Cobb <willcobb>`.

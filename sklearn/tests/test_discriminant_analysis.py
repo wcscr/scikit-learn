@@ -901,7 +901,11 @@ def test_lda_partial_fit_missing_classes_in_chunk(solver):
     # Feed data in per-class chunks so each chunk is missing 2 classes
     for c in classes:
         mask = y_full == c
-        clf_online.partial_fit(X_full[mask], y_full[mask], classes=classes if c == classes[0] else None)
+        clf_online.partial_fit(
+            X_full[mask],
+            y_full[mask],
+            classes=classes if c == classes[0] else None,
+        )
 
     assert_allclose(clf_online.means_, clf_batch.means_, atol=1e-7)
     assert_allclose(clf_online.covariance_, clf_batch.covariance_, atol=1e-7)
@@ -973,7 +977,10 @@ def test_lda_partial_fit_collinear_features():
 def test_lda_partial_fit_raises_svd():
     """solver='svd' must raise NotImplementedError."""
     clf = LinearDiscriminantAnalysis(solver="svd")
-    with pytest.raises(NotImplementedError, match="partial_fit does not support solver='svd'"):
+    with pytest.raises(
+        NotImplementedError,
+        match="partial_fit does not support solver='svd'",
+    ):
         clf.partial_fit(X, y, classes=np.unique(y))
 
 
@@ -1046,3 +1053,90 @@ def test_lda_partial_fit_predict(solver):
         clf_batch.predict_proba(X_full),
         atol=1e-7,
     )
+
+
+@pytest.mark.parametrize("solver", ["eigen", "lsqr"])
+def test_lda_partial_fit_after_fit(solver):
+    """partial_fit after fit must not crash and must work correctly."""
+    X_full, y_full = make_classification(
+        n_samples=200,
+        n_features=4,
+        n_informative=4,
+        n_redundant=0,
+        n_classes=2,
+        random_state=42,
+    )
+    classes = np.unique(y_full)
+
+    # First fit, then partial_fit
+    clf = LinearDiscriminantAnalysis(solver=solver)
+    clf.fit(X_full, y_full)
+    clf.partial_fit(X_full, y_full)
+
+    # Compare against a fresh partial_fit-only estimator
+    clf_fresh = LinearDiscriminantAnalysis(solver=solver)
+    clf_fresh.partial_fit(X_full, y_full, classes=classes)
+
+    assert_allclose(clf.means_, clf_fresh.means_, atol=1e-7)
+    assert_allclose(clf.coef_, clf_fresh.coef_, atol=1e-7)
+    assert_allclose(clf.intercept_, clf_fresh.intercept_, atol=1e-7)
+
+
+def test_lda_partial_fit_raises_unknown_labels():
+    """Unknown labels in y must raise ValueError."""
+    clf = LinearDiscriminantAnalysis(solver="lsqr")
+    clf.partial_fit(X, y, classes=np.array([1, 2]))
+
+    X_new = np.array([[0.0, 0.0]])
+    y_new = np.array([99])
+    with pytest.raises(ValueError, match="do not exist in the initial"):
+        clf.partial_fit(X_new, y_new)
+
+
+@pytest.mark.parametrize("solver", ["eigen", "lsqr"])
+def test_lda_partial_fit_honors_priors(solver):
+    """User-supplied priors must be used instead of count-based priors."""
+    X_full, y_full = make_classification(
+        n_samples=200,
+        n_features=4,
+        n_informative=4,
+        n_redundant=0,
+        n_classes=2,
+        random_state=42,
+    )
+    classes = np.unique(y_full)
+    explicit_priors = [0.3, 0.7]
+
+    clf_priors = LinearDiscriminantAnalysis(
+        solver=solver, priors=explicit_priors
+    )
+    clf_priors.partial_fit(X_full, y_full, classes=classes)
+
+    clf_no_priors = LinearDiscriminantAnalysis(solver=solver)
+    clf_no_priors.partial_fit(X_full, y_full, classes=classes)
+
+    assert_allclose(clf_priors.priors_, explicit_priors, atol=1e-10)
+    # intercept_ should differ when priors differ
+    assert not np.allclose(
+        clf_priors.intercept_,
+        clf_no_priors.intercept_,
+        atol=1e-5,
+    )
+
+
+def test_lda_partial_fit_lsqr_low_samples():
+    """lsqr must work when N_total - n_classes < n_features."""
+    rng = np.random.RandomState(42)
+    n_features = 10
+    # 4 samples, 2 classes => within_df = 4 - 2 = 2 < 10
+    X_small = rng.randn(4, n_features)
+    y_small = np.array([0, 0, 1, 1])
+    classes = np.array([0, 1])
+
+    clf = LinearDiscriminantAnalysis(solver="lsqr")
+    clf.partial_fit(X_small, y_small, classes=classes)
+
+    # Should have coef_ and be usable for prediction
+    assert hasattr(clf, "coef_")
+    predictions = clf.predict(X_small)
+    assert predictions.shape == (4,)
