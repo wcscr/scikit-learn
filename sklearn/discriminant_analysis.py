@@ -951,6 +951,10 @@ class LinearDiscriminantAnalysis(
         self._n_features_out = self._max_components
         return self
 
+    def __sklearn_is_fitted__(self):
+        """Check fitted status by verifying solver output exists."""
+        return hasattr(self, "coef_")
+
     def transform(self, X):
         """Project data to maximize class separation.
 

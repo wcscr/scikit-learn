@@ -74,16 +74,17 @@ within-df check is only needed for the `eigen` solver.
 
 ## 5. [P1] Early-return path can leave a half-fitted estimator
 
-**Status:** Addressed via documentation
+**Status:** Fixed
 
-**Changes:** Added a `Notes` section to the `partial_fit` docstring explaining that the
-estimator is not usable for prediction until all classes have been observed and sufficient
-samples have been accumulated. Until then, calling `predict` will raise `NotFittedError`.
+**Changes:** Added a `__sklearn_is_fitted__` method to `LinearDiscriminantAnalysis` that
+returns `hasattr(self, "coef_")`. This is the standard scikit-learn pattern (used by
+`Pipeline`, `FeatureUnion`, `FunctionTransformer`) — `check_is_fitted` checks for this
+method first. Since `coef_` is only set after the solver runs, early-return paths that set
+accumulator attributes (`means_`, `priors_`) will not cause the estimator to appear fitted.
 
-This mirrors behavior of other partial_fit estimators. The `means_` attribute must remain
-set as it serves as a running accumulator for the online update. Since `coef_` is not set
-until the solver runs, `check_is_fitted` in `predict`/`decision_function` will correctly
-raise `NotFittedError`.
+**Test added:** `test_lda_partial_fit_early_return_not_fitted` — verifies that `predict`
+raises `NotFittedError` (not `AttributeError`) after an early-return `partial_fit` where
+only one class has been observed.
 
 ---
 

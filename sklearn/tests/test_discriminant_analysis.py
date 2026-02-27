@@ -1124,6 +1124,18 @@ def test_lda_partial_fit_honors_priors(solver):
     )
 
 
+def test_lda_partial_fit_early_return_not_fitted():
+    """Early-return partial_fit must raise NotFittedError on predict."""
+    from sklearn.exceptions import NotFittedError
+
+    # Only one class seen => early return
+    clf = LinearDiscriminantAnalysis(solver="lsqr")
+    clf.partial_fit(X[:3], np.array([1, 1, 1]), classes=np.array([1, 2]))
+
+    with pytest.raises(NotFittedError):
+        clf.predict(X)
+
+
 def test_lda_partial_fit_lsqr_low_samples():
     """lsqr must work when N_total - n_classes < n_features."""
     rng = np.random.RandomState(42)
