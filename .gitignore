@@ -97,5 +97,11 @@ jupyterlite_contents
 # file recognised by vscode IDEs containing env variables
 .env
 
+# Local tooling and environment
+.claude/
+.docker/
+.devcontainer/
+.venv/
+
 # Large data files
 DPAContestV2_Template_IVs.hdf5
