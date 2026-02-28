@@ -1,0 +1,15 @@
+.venv
+.git
+build
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.so
+*.egg-info
+dist
+doc/_build
+doc/auto_examples
+asv_benchmarks/env
+asv_benchmarks/html
+asv_benchmarks/results

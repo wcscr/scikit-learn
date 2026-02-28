@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+# Ensure .claude dir exists on host so the bind-mount doesn't create it as
+# root-owned (which would make settings.json unwritable inside the container).
+mkdir -p "$(pwd)/.claude"
+
+docker run --rm -it \
+    -v "$(pwd)":/workspace \
+    -v "$(pwd)/.claude":/home/agent/.claude \
+    -e CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN" \
+    sklearn-lda-claude

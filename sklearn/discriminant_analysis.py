@@ -764,9 +764,13 @@ class LinearDiscriminantAnalysis(
         """Incrementally fit the Linear Discriminant Analysis model.
 
         This method allows online learning by updating sufficient statistics
-        with each new batch of data using Chan's parallel variance update
-        algorithm. The resulting model is mathematically equivalent to fitting
-        on all data at once.
+        with each new batch of data using a pairwise moment-merge update [1]_:
+
+        ``S_new = S_old + S_chunk + (n_old * n_chunk / n_new) * outer(delta, delta)``
+
+        where ``delta = mean_chunk - mean_old``. This is applied per class to
+        accumulate the pooled within-class scatter matrix. The resulting model
+        is mathematically equivalent to fitting on all data at once.
 
         .. versionadded:: 1.9
 
@@ -794,6 +798,16 @@ class LinearDiscriminantAnalysis(
         been observed and sufficient samples have been accumulated (at
         least ``n_classes`` total samples for the ``eigen`` solver).
         Until then, calling ``predict`` will raise ``NotFittedError``.
+
+        References
+        ----------
+        .. [1] T. F. Chan, G. H. Golub, and R. J. LeVeque, "Updating formulae
+               and a pairwise algorithm for computing sample variances,"
+               Technical Report STAN-CS-79-773, Stanford University, 1979.
+
+        .. [2] T. F. Chan, G. H. Golub, and R. J. LeVeque, "Algorithms for
+               computing the sample variance: Analysis and recommendations,"
+               The American Statistician, vol. 37, no. 3, pp. 242-247, 1983.
         """
         if self.solver == "svd":
             raise NotImplementedError(
