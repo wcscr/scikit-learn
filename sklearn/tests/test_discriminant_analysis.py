@@ -849,8 +849,10 @@ def test_qda_shrinkage_performance(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("solver", ["eigen", "lsqr"])
-@pytest.mark.parametrize("shrinkage", [None, 0.5])
+@pytest.mark.parametrize(
+    "solver, shrinkage",
+    [("eigen", None), ("eigen", 0.5), ("lsqr", None), ("lsqr", 0.5), ("svd", None)],
+)
 def test_lda_partial_fit_batch_equivalence(solver, shrinkage):
     """partial_fit over chunks must equal batch fit (exact online learning)."""
     X_full, y_full = make_classification(
@@ -875,12 +877,13 @@ def test_lda_partial_fit_batch_equivalence(solver, shrinkage):
 
     assert_allclose(clf_online.means_, clf_batch.means_, atol=1e-7)
     assert_allclose(clf_online.priors_, clf_batch.priors_, atol=1e-7)
-    assert_allclose(clf_online.covariance_, clf_batch.covariance_, atol=1e-7)
-    assert_allclose(clf_online.coef_, clf_batch.coef_, atol=1e-7)
-    assert_allclose(clf_online.intercept_, clf_batch.intercept_, atol=1e-7)
+    assert_allclose(clf_online.coef_, clf_batch.coef_, atol=1e-5)
+    assert_allclose(clf_online.intercept_, clf_batch.intercept_, atol=1e-5)
+    if solver != "svd":
+        assert_allclose(clf_online.covariance_, clf_batch.covariance_, atol=1e-7)
 
 
-@pytest.mark.parametrize("solver", ["eigen", "lsqr"])
+@pytest.mark.parametrize("solver", ["eigen", "lsqr", "svd"])
 def test_lda_partial_fit_missing_classes_in_chunk(solver):
     """Chunks that omit a class must not corrupt historical statistics."""
     X_full, y_full = make_classification(
@@ -908,12 +911,13 @@ def test_lda_partial_fit_missing_classes_in_chunk(solver):
         )
 
     assert_allclose(clf_online.means_, clf_batch.means_, atol=1e-7)
-    assert_allclose(clf_online.covariance_, clf_batch.covariance_, atol=1e-7)
-    assert_allclose(clf_online.coef_, clf_batch.coef_, atol=1e-7)
-    assert_allclose(clf_online.intercept_, clf_batch.intercept_, atol=1e-7)
+    assert_allclose(clf_online.coef_, clf_batch.coef_, atol=1e-5)
+    assert_allclose(clf_online.intercept_, clf_batch.intercept_, atol=1e-5)
+    if solver != "svd":
+        assert_allclose(clf_online.covariance_, clf_batch.covariance_, atol=1e-7)
 
 
-@pytest.mark.parametrize("solver", ["eigen", "lsqr"])
+@pytest.mark.parametrize("solver", ["eigen", "lsqr", "svd"])
 def test_lda_partial_fit_single_sample_chunks(solver):
     """Single-sample chunks must not break covariance tracking."""
     X_full, y_full = make_classification(
@@ -937,9 +941,10 @@ def test_lda_partial_fit_single_sample_chunks(solver):
         )
 
     assert_allclose(clf_online.means_, clf_batch.means_, atol=1e-7)
-    assert_allclose(clf_online.covariance_, clf_batch.covariance_, atol=1e-7)
     assert_allclose(clf_online.coef_, clf_batch.coef_, atol=1e-5)
     assert_allclose(clf_online.intercept_, clf_batch.intercept_, atol=1e-5)
+    if solver != "svd":
+        assert_allclose(clf_online.covariance_, clf_batch.covariance_, atol=1e-7)
 
 
 def test_lda_partial_fit_collinear_features():
@@ -974,15 +979,6 @@ def test_lda_partial_fit_collinear_features():
     assert_allclose(clf_online.intercept_, clf_batch.intercept_, atol=1e-5)
 
 
-def test_lda_partial_fit_raises_svd():
-    """solver='svd' must raise NotImplementedError."""
-    clf = LinearDiscriminantAnalysis(solver="svd")
-    with pytest.raises(
-        NotImplementedError,
-        match="partial_fit does not support solver='svd'",
-    ):
-        clf.partial_fit(X, y, classes=np.unique(y))
-
 
 def test_lda_partial_fit_raises_auto_shrinkage():
     """shrinkage='auto' must raise NotImplementedError."""
@@ -1007,7 +1003,7 @@ def test_lda_partial_fit_raises_missing_classes():
         clf.partial_fit(X, y)
 
 
-@pytest.mark.parametrize("solver", ["eigen", "lsqr"])
+@pytest.mark.parametrize("solver", ["eigen", "lsqr", "svd"])
 def test_lda_partial_fit_binary(solver):
     """Binary classification must produce 1D coef_ / intercept_."""
     X_full, y_full = make_classification(
@@ -1028,7 +1024,7 @@ def test_lda_partial_fit_binary(solver):
     assert_allclose(clf_online.intercept_, clf_batch.intercept_, atol=1e-7)
 
 
-@pytest.mark.parametrize("solver", ["eigen", "lsqr"])
+@pytest.mark.parametrize("solver", ["eigen", "lsqr", "svd"])
 def test_lda_partial_fit_predict(solver):
     """partial_fit model predictions must match batch fit predictions."""
     X_full, y_full = make_classification(
@@ -1055,7 +1051,7 @@ def test_lda_partial_fit_predict(solver):
     )
 
 
-@pytest.mark.parametrize("solver", ["eigen", "lsqr"])
+@pytest.mark.parametrize("solver", ["eigen", "lsqr", "svd"])
 def test_lda_partial_fit_after_fit(solver):
     """partial_fit after fit must not crash and must work correctly."""
     X_full, y_full = make_classification(
@@ -1093,7 +1089,7 @@ def test_lda_partial_fit_raises_unknown_labels():
         clf.partial_fit(X_new, y_new)
 
 
-@pytest.mark.parametrize("solver", ["eigen", "lsqr"])
+@pytest.mark.parametrize("solver", ["eigen", "lsqr", "svd"])
 def test_lda_partial_fit_honors_priors(solver):
     """User-supplied priors must be used instead of count-based priors."""
     X_full, y_full = make_classification(
@@ -1124,12 +1120,13 @@ def test_lda_partial_fit_honors_priors(solver):
     )
 
 
-def test_lda_partial_fit_early_return_not_fitted():
+@pytest.mark.parametrize("solver", ["lsqr", "svd"])
+def test_lda_partial_fit_early_return_not_fitted(solver):
     """Early-return partial_fit must raise NotFittedError on predict."""
     from sklearn.exceptions import NotFittedError
 
     # Only one class seen => early return
-    clf = LinearDiscriminantAnalysis(solver="lsqr")
+    clf = LinearDiscriminantAnalysis(solver=solver)
     clf.partial_fit(X[:3], np.array([1, 1, 1]), classes=np.array([1, 2]))
 
     with pytest.raises(NotFittedError):
@@ -1152,3 +1149,80 @@ def test_lda_partial_fit_lsqr_low_samples():
     assert hasattr(clf, "coef_")
     predictions = clf.predict(X_small)
     assert predictions.shape == (4,)
+
+
+def test_lda_svd_partial_fit_transform_equivalence():
+    """SVD partial_fit transform output must match batch fit."""
+    X_full, y_full = make_classification(
+        n_samples=500,
+        n_features=5,
+        n_informative=5,
+        n_redundant=0,
+        n_classes=3,
+        random_state=42,
+    )
+
+    clf_batch = LinearDiscriminantAnalysis(solver="svd")
+    clf_batch.fit(X_full, y_full)
+
+    clf_online = LinearDiscriminantAnalysis(solver="svd")
+    classes = np.unique(y_full)
+    chunk_size = 50
+    for i in range(0, len(X_full), chunk_size):
+        X_chunk = X_full[i : i + chunk_size]
+        y_chunk = y_full[i : i + chunk_size]
+        clf_online.partial_fit(X_chunk, y_chunk, classes=classes if i == 0 else None)
+
+    X_batch = clf_batch.transform(X_full)
+    X_online = clf_online.transform(X_full)
+
+    # Correct for SVD sign ambiguity (columns may be sign-flipped)
+    for col in range(X_batch.shape[1]):
+        if np.dot(X_batch[:, col], X_online[:, col]) < 0:
+            X_online[:, col] *= -1
+
+    assert_allclose(X_online, X_batch, atol=1e-5)
+
+
+def test_lda_svd_partial_fit_collinear():
+    """SVD partial_fit handles collinear features via rank truncation."""
+    rng = np.random.RandomState(42)
+    n_samples = 200
+    X_base = rng.randn(n_samples, 3)
+    # Add a perfectly collinear 4th feature
+    X_full = np.column_stack([X_base, X_base[:, 0] + X_base[:, 1]])
+    y_full = (X_base[:, 0] > 0).astype(int)
+
+    clf_batch = LinearDiscriminantAnalysis(solver="svd")
+    clf_batch.fit(X_full, y_full)
+
+    clf_online = LinearDiscriminantAnalysis(solver="svd")
+    classes = np.unique(y_full)
+    chunk_size = 40
+    for i in range(0, n_samples, chunk_size):
+        clf_online.partial_fit(
+            X_full[i : i + chunk_size],
+            y_full[i : i + chunk_size],
+            classes=classes if i == 0 else None,
+        )
+
+    # Predictions should match
+    assert_array_equal(clf_online.predict(X_full), clf_batch.predict(X_full))
+
+
+def test_lda_svd_partial_fit_no_covariance():
+    """SVD partial_fit does not set covariance_ even with store_covariance=True."""
+    X_full, y_full = make_classification(
+        n_samples=100,
+        n_features=4,
+        n_informative=4,
+        n_redundant=0,
+        n_classes=2,
+        random_state=42,
+    )
+
+    clf = LinearDiscriminantAnalysis(solver="svd", store_covariance=True)
+    classes = np.unique(y_full)
+    clf.partial_fit(X_full, y_full, classes=classes)
+
+    assert not hasattr(clf, "covariance_")

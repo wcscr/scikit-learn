@@ -659,6 +659,186 @@ class LinearDiscriminantAnalysis(
         self.coef_ = coef @ self.scalings_.T
         self.intercept_ -= self.xbar_ @ self.coef_.T
 
+    def _partial_fit_svd(self, X, y, first_call):
+        """Incremental SVD update for partial_fit.
+
+        Maintains a compact SVD factorization (S, Vt) of all within-class
+        centered data seen so far, avoiding O(D^2) covariance storage.
+
+        Parameters
+        ----------
+        X : ndarray of shape (n_samples, n_features)
+            Training data (already validated).
+
+        y : ndarray of shape (n_samples,)
+            Target values (already validated).
+
+        first_call : bool
+            Whether this is the first call to partial_fit.
+        """
+        n_features = X.shape[1]
+        n_classes = len(self.classes_)
+
+        # --- Initialize streaming state ---
+        if first_call or not hasattr(self, "_unscaled_S"):
+            self._class_counts = np.zeros(n_classes, dtype=np.float64)
+            self.means_ = np.zeros((n_classes, n_features), dtype=np.float64)
+            self._unscaled_S = np.empty(0, dtype=np.float64)
+            self._unscaled_Vt = np.empty(
+                (0, n_features), dtype=np.float64
+            )
+
+        # --- Per-chunk: compute local stats ---
+        chunk_means = np.zeros((n_classes, n_features), dtype=np.float64)
+        chunk_counts = np.zeros(n_classes, dtype=np.float64)
+        for idx, c in enumerate(self.classes_):
+            mask = y == c
+            m_k = np.sum(mask)
+            if m_k > 0:
+                chunk_means[idx] = np.mean(X[mask], axis=0)
+                chunk_counts[idx] = m_k
+
+        # --- Compute mean-shift correction vectors (parallel axis theorem) ---
+        mean_shift_rows = []
+        for idx in range(n_classes):
+            N_old = self._class_counts[idx]
+            N_chunk = chunk_counts[idx]
+            if N_old > 0 and N_chunk > 0:
+                N_new = N_old + N_chunk
+                weight = np.sqrt(N_old * N_chunk / N_new)
+                mean_shift_rows.append(
+                    weight * (self.means_[idx] - chunk_means[idx])
+                )
+
+        # --- Update global means and counts ---
+        for idx in range(n_classes):
+            m_k = chunk_counts[idx]
+            if m_k == 0:
+                continue
+            N_old = self._class_counts[idx]
+            N_new = N_old + m_k
+            delta = chunk_means[idx] - self.means_[idx]
+            self.means_[idx] += (m_k / N_new) * delta
+            self._class_counts[idx] = N_new
+
+        # --- Center chunk by local class means ---
+        Xc = np.empty_like(X)
+        for idx, c in enumerate(self.classes_):
+            mask = y == c
+            if np.any(mask):
+                Xc[mask] = X[mask] - chunk_means[idx]
+
+        # --- Build block matrix Z ---
+        blocks = []
+        if self._unscaled_S.size > 0:
+            blocks.append(self._unscaled_S[:, None] * self._unscaled_Vt)
+        blocks.append(Xc)
+        if mean_shift_rows:
+            blocks.append(np.array(mean_shift_rows))
+        Z = np.vstack(blocks)
+
+        # --- SVD of block matrix ---
+        _, S_new, Vt_new = scipy.linalg.svd(Z, full_matrices=False)
+
+        # Truncate negligible components
+        keep = S_new > self.tol
+        self._unscaled_S = S_new[keep]
+        self._unscaled_Vt = Vt_new[keep]
+
+        # --- Early return if fewer than 2 classes seen or insufficient df ---
+        n_classes_seen = np.count_nonzero(self._class_counts)
+        N_total = self._class_counts.sum()
+        if n_classes_seen < 2 or N_total <= n_classes_seen:
+            return
+
+        # --- Derive priors ---
+        N_total = self._class_counts.sum()
+        if self.priors is not None:
+            self.priors_ = np.asarray(self.priors, dtype=np.float64)
+            if np.any(self.priors_ < 0):
+                raise ValueError("priors must be non-negative")
+            if np.abs(np.sum(self.priors_) - 1.0) > 1e-5:
+                warnings.warn(
+                    "The priors do not sum to 1. Renormalizing",
+                    UserWarning,
+                )
+                self.priors_ = self.priors_ / self.priors_.sum()
+        else:
+            self.priors_ = self._class_counts / N_total
+
+        # --- Maximum number of components ---
+        max_components = min(n_classes - 1, n_features)
+        if self.n_components is None:
+            self._max_components = max_components
+        else:
+            if self.n_components > max_components:
+                raise ValueError(
+                    "n_components cannot be larger than "
+                    "min(n_features, n_classes - 1)."
+                )
+            self._max_components = self.n_components
+
+        # --- Reconstruct public attributes from compact SVD ---
+        # Reconstruct within-class std from the SVD factors
+        # std[j] = sqrt(sum_i (S[i] * Vt[i,j])^2 / N_total)
+        SVt = self._unscaled_S[:, None] * self._unscaled_Vt
+        std = np.sqrt(np.sum(SVt**2, axis=0) / N_total)
+        std[std == 0] = 1.0
+
+        # Within-class scaling (equivalent to batch _solve_svd)
+        fac = 1.0 / (N_total - n_classes_seen)
+        scaled = np.sqrt(fac) * (SVt / std)
+        _, S_scaled, Vt_scaled = scipy.linalg.svd(
+            scaled, full_matrices=False
+        )
+
+        rank = np.sum(S_scaled > self.tol)
+        if rank == 0:
+            rank = 1  # ensure at least one component
+        scalings = (Vt_scaled[:rank, :] / std).T / S_scaled[:rank]
+
+        # Between-class scaling
+        self.xbar_ = self.priors_ @ self.means_
+        fac_between = 1.0 if n_classes == 1 else 1.0 / (n_classes - 1)
+        X_between = (
+            (np.sqrt((N_total * self.priors_) * fac_between))
+            * (self.means_ - self.xbar_).T
+        ).T @ scalings
+
+        _, S_between, Vt_between = scipy.linalg.svd(
+            X_between, full_matrices=False
+        )
+
+        if self._max_components == 0:
+            self.explained_variance_ratio_ = np.empty(
+                (0,), dtype=S_between.dtype
+            )
+        else:
+            s2_sum = np.sum(S_between**2)
+            if s2_sum > 0:
+                self.explained_variance_ratio_ = (
+                    S_between**2 / s2_sum
+                )[: self._max_components]
+            else:
+                self.explained_variance_ratio_ = np.zeros(
+                    min(len(S_between), self._max_components),
+                    dtype=S_between.dtype,
+                )
+
+        if len(S_between) > 0:
+            rank_between = np.sum(S_between > self.tol * S_between[0])
+        else:
+            rank_between = 0
+        if rank_between == 0:
+            rank_between = 1
+        self.scalings_ = scalings @ Vt_between.T[:, :rank_between]
+        coef = (self.means_ - self.xbar_) @ self.scalings_
+        self.intercept_ = (
+            -0.5 * np.sum(coef**2, axis=1) + np.log(self.priors_)
+        )
+        self.coef_ = coef @ self.scalings_.T
+        self.intercept_ -= self.xbar_ @ self.coef_.T
+
     @_fit_context(
         # LinearDiscriminantAnalysis.covariance_estimator is not validated yet
         prefer_skip_nested_validation=False
@@ -809,16 +989,12 @@ class LinearDiscriminantAnalysis(
                computing the sample variance: Analysis and recommendations,"
                The American Statistician, vol. 37, no. 3, pp. 242-247, 1983.
         """
-        if self.solver == "svd":
-            raise NotImplementedError(
-                "partial_fit does not support solver='svd'. "
-                "Use solver='eigen' or solver='lsqr'."
-            )
-        if self.shrinkage == "auto" or self.covariance_estimator is not None:
-            raise NotImplementedError(
-                "partial_fit does not support shrinkage='auto' or a custom "
-                "covariance_estimator. Use a float shrinkage value or None."
-            )
+        if self.solver != "svd":
+            if self.shrinkage == "auto" or self.covariance_estimator is not None:
+                raise NotImplementedError(
+                    "partial_fit does not support shrinkage='auto' or a custom "
+                    "covariance_estimator. Use a float shrinkage value or None."
+                )
 
         first_call = _check_partial_fit_first_call(self, classes)
 
@@ -831,6 +1007,48 @@ class LinearDiscriminantAnalysis(
             reset=first_call,
         )
 
+        # Validate that y contains only known classes
+        unexpected = np.setdiff1d(y, self.classes_)
+        if len(unexpected) > 0:
+            raise ValueError(
+                f"The target label(s) {unexpected} in y do not exist "
+                f"in the initial classes {self.classes_}"
+            )
+
+        # Route to solver-specific method
+        if self.solver == "svd":
+            self._partial_fit_svd(X, y, first_call)
+        else:
+            self._partial_fit_covariance(X, y, first_call)
+
+        # Binary case: reduce to 1D output
+        if hasattr(self, "coef_") and len(self.classes_) == 2:
+            self.coef_ = (self.coef_[1, :] - self.coef_[0, :])[np.newaxis, :]
+            self.intercept_ = np.array(
+                [self.intercept_[1] - self.intercept_[0]]
+            )
+
+        if hasattr(self, "_max_components"):
+            self._n_features_out = self._max_components
+        return self
+
+    def _partial_fit_covariance(self, X, y, first_call):
+        """Covariance-based incremental update for partial_fit.
+
+        Uses Chan's parallel variance update to accumulate the pooled
+        within-class scatter matrix. Used by eigen and lsqr solvers.
+
+        Parameters
+        ----------
+        X : ndarray of shape (n_samples, n_features)
+            Training data (already validated).
+
+        y : ndarray of shape (n_samples,)
+            Target values (already validated).
+
+        first_call : bool
+            Whether this is the first call to partial_fit.
+        """
         n_features = X.shape[1]
         n_classes = len(self.classes_)
 
@@ -843,14 +1061,6 @@ class LinearDiscriminantAnalysis(
             )
             self._unscaled_covariance = np.zeros(
                 (n_features, n_features), dtype=np.float64
-            )
-
-        # Validate that y contains only known classes
-        unexpected = np.setdiff1d(y, self.classes_)
-        if len(unexpected) > 0:
-            raise ValueError(
-                f"The target label(s) {unexpected} in y do not exist "
-                f"in the initial classes {self.classes_}"
             )
 
         # --- Chan's parallel variance update per class ---
@@ -901,7 +1111,7 @@ class LinearDiscriminantAnalysis(
         if n_classes_seen < 2 or (
             self.solver == "eigen" and within_df < n_features
         ):
-            return self
+            return
 
         # Maximum number of components
         max_components = min(n_classes - 1, n_features)
@@ -954,16 +1164,6 @@ class LinearDiscriminantAnalysis(
             self._solve_eigen_from_matrices(Sb=Sb, Sw=covariance)
         elif self.solver == "lsqr":
             self._solve_lsqr_from_covariance(covariance)
-
-        # Binary case: reduce to 1D output
-        if len(self.classes_) == 2:
-            self.coef_ = (self.coef_[1, :] - self.coef_[0, :])[np.newaxis, :]
-            self.intercept_ = np.array(
-                [self.intercept_[1] - self.intercept_[0]]
-            )
-
-        self._n_features_out = self._max_components
-        return self
 
     def __sklearn_is_fitted__(self):
         """Check fitted status by verifying solver output exists."""
