@@ -20,7 +20,15 @@ from sklearn.base import (
 from sklearn.covariance import empirical_covariance, ledoit_wolf, shrunk_covariance
 from sklearn.linear_model._base import LinearClassifierMixin
 from sklearn.preprocessing import StandardScaler
-from sklearn.utils._array_api import _expit, device, get_namespace, size
+from sklearn.utils._array_api import (
+    _expit,
+    _is_numpy_namespace,
+    device,
+    get_namespace,
+    get_namespace_and_device,
+    size,
+)
+import sklearn.externals.array_api_extra as xpx
 from sklearn.utils._param_validation import HasMethods, Interval, StrOptions
 from sklearn.utils.extmath import softmax
 from sklearn.utils.multiclass import (
@@ -702,15 +710,27 @@ class LinearDiscriminantAnalysis(
         Assumes priors_ and _max_components are already set by
         _partial_fit_svd.
         """
+        xp = self._array_api_xp
+        device_ = self._array_api_device
+
         n_classes = len(self.classes_)
-        n_classes_seen = np.count_nonzero(self._class_counts)
+        n_classes_seen = int(
+            xp.sum(xp.astype(self._class_counts != 0, xp.int64))
+        )
         N_total = self._class_counts.sum()
+
+        if _is_numpy_namespace(xp):
+            svd = lambda M: scipy.linalg.svd(
+                M, full_matrices=False, check_finite=False
+            )
+        else:
+            svd = lambda M: xp.linalg.svd(M, full_matrices=False)
 
         # --- Reconstruct public attributes from compact SVD ---
         # Compute within-class std without materializing full S*Vt matrix:
         # std[j] = sqrt(sum_i (S[i] * Vt[i,j])^2 / N_total)
         #        = sqrt((S^2 @ Vt^2) / N_total)
-        std = np.sqrt(
+        std = xp.sqrt(
             (self._unscaled_S**2) @ (self._unscaled_Vt**2) / N_total
         )
         std[std == 0] = 1.0
@@ -718,12 +738,10 @@ class LinearDiscriminantAnalysis(
         # Within-class scaling (equivalent to batch _solve_svd)
         fac = 1.0 / (N_total - n_classes_seen)
         SVt = self._unscaled_S[:, None] * self._unscaled_Vt
-        scaled = np.sqrt(fac) * (SVt / std)
-        _, S_scaled, Vt_scaled = scipy.linalg.svd(
-            scaled, full_matrices=False, check_finite=False
-        )
+        scaled = xp.sqrt(fac) * (SVt / std)
+        _, S_scaled, Vt_scaled = svd(scaled)
 
-        rank = np.sum(S_scaled > self.tol)
+        rank = int(xp.sum(xp.astype(S_scaled > self.tol, xp.int32)))
         if rank == 0:
             rank = 1  # ensure at least one component
         scalings = (Vt_scaled[:rank, :] / std).T / S_scaled[:rank]
@@ -732,32 +750,33 @@ class LinearDiscriminantAnalysis(
         self.xbar_ = self.priors_ @ self.means_
         fac_between = 1.0 if n_classes == 1 else 1.0 / (n_classes - 1)
         X_between = (
-            (np.sqrt((N_total * self.priors_) * fac_between))
+            (xp.sqrt((N_total * self.priors_) * fac_between))
             * (self.means_ - self.xbar_).T
         ).T @ scalings
 
-        _, S_between, Vt_between = scipy.linalg.svd(
-            X_between, full_matrices=False, check_finite=False
-        )
+        _, S_between, Vt_between = svd(X_between)
 
         if self._max_components == 0:
-            self.explained_variance_ratio_ = np.empty(
-                (0,), dtype=S_between.dtype
+            self.explained_variance_ratio_ = xp.zeros(
+                (0,), dtype=S_between.dtype, device=device_
             )
         else:
-            s2_sum = np.sum(S_between**2)
+            s2_sum = xp.sum(S_between**2)
             if s2_sum > 0:
                 self.explained_variance_ratio_ = (
                     S_between**2 / s2_sum
                 )[: self._max_components]
             else:
-                self.explained_variance_ratio_ = np.zeros(
+                self.explained_variance_ratio_ = xp.zeros(
                     min(len(S_between), self._max_components),
                     dtype=S_between.dtype,
+                    device=device_,
                 )
 
         if len(S_between) > 0:
-            rank_between = np.sum(S_between > self.tol * S_between[0])
+            rank_between = int(
+                xp.sum(xp.astype(S_between > self.tol * S_between[0], xp.int32))
+            )
         else:
             rank_between = 0
         if rank_between == 0:
@@ -765,22 +784,22 @@ class LinearDiscriminantAnalysis(
         self.scalings_ = scalings @ Vt_between.T[:, :rank_between]
         coef = (self.means_ - self.xbar_) @ self.scalings_
         self.intercept_ = (
-            -0.5 * np.sum(coef**2, axis=1) + np.log(self.priors_)
+            -0.5 * xp.sum(coef**2, axis=1) + xp.log(self.priors_)
         )
         self.coef_ = coef @ self.scalings_.T
         self.intercept_ -= self.xbar_ @ self.coef_.T
 
         # Binary case: reduce to 1D output (moved from partial_fit)
         if len(self.classes_) == 2:
-            self.coef_ = (self.coef_[1, :] - self.coef_[0, :])[np.newaxis, :]
-            self.intercept_ = np.array(
-                [self.intercept_[1] - self.intercept_[0]]
-            )
+            coef_ = self.coef_[1, :] - self.coef_[0, :]
+            self.coef_ = xp.reshape(coef_, (1, -1))
+            intercept_ = self.intercept_[1] - self.intercept_[0]
+            self.intercept_ = xp.reshape(intercept_, (1,))
 
         self._n_features_out = self._max_components
         self._svd_attrs_stale = False
 
-    def _partial_fit_svd(self, X, y, first_call):
+    def _partial_fit_svd(self, X, y, first_call, xp, device_):
         """Incremental SVD update for partial_fit.
 
         Maintains a compact SVD factorization (S, Vt) of all within-class
@@ -798,27 +817,50 @@ class LinearDiscriminantAnalysis(
 
         first_call : bool
             Whether this is the first call to partial_fit.
+
+        xp : module
+            Array API namespace.
+
+        device_ : device
+            Device for array creation.
         """
         n_samples, n_features = X.shape
         n_classes = len(self.classes_)
 
+        # Store namespace for lazy reconstruction
+        self._array_api_xp = xp
+        self._array_api_device = device_
+
+        if _is_numpy_namespace(xp):
+            svd = lambda M: scipy.linalg.svd(
+                M, full_matrices=False, check_finite=False
+            )
+        else:
+            svd = lambda M: xp.linalg.svd(M, full_matrices=False)
+
         # --- Initialize streaming state ---
         if first_call or not hasattr(self, "_unscaled_S"):
-            self._class_counts = np.zeros(n_classes, dtype=np.float64)
-            self.means_ = np.zeros((n_classes, n_features), dtype=np.float64)
-            self._unscaled_S = np.empty(0, dtype=np.float64)
-            self._unscaled_Vt = np.empty(
-                (0, n_features), dtype=np.float64
+            self._class_counts = xp.zeros(
+                n_classes, dtype=xp.float64, device=device_
+            )
+            self.means_ = xp.zeros(
+                (n_classes, n_features), dtype=xp.float64, device=device_
+            )
+            self._unscaled_S = xp.zeros(0, dtype=xp.float64, device=device_)
+            self._unscaled_Vt = xp.zeros(
+                (0, n_features), dtype=xp.float64, device=device_
             )
 
         # --- Per-chunk: compute local stats ---
-        chunk_means = np.zeros((n_classes, n_features), dtype=np.float64)
-        chunk_counts = np.zeros(n_classes, dtype=np.float64)
+        chunk_means = xp.zeros(
+            (n_classes, n_features), dtype=xp.float64, device=device_
+        )
+        chunk_counts = xp.zeros(n_classes, dtype=xp.float64, device=device_)
         for idx, c in enumerate(self.classes_):
             mask = y == c
-            m_k = np.sum(mask)
+            m_k = int(xp.sum(xp.astype(mask, xp.int64)))
             if m_k > 0:
-                chunk_means[idx] = np.mean(X[mask], axis=0)
+                chunk_means[idx] = xp.mean(X[mask], axis=0)
                 chunk_counts[idx] = m_k
 
         # --- Compute mean-shift correction vectors (parallel axis theorem) ---
@@ -828,7 +870,7 @@ class LinearDiscriminantAnalysis(
             N_chunk = chunk_counts[idx]
             if N_old > 0 and N_chunk > 0:
                 N_new = N_old + N_chunk
-                weight = np.sqrt(N_old * N_chunk / N_new)
+                weight = xp.sqrt(N_old * N_chunk / N_new)
                 mean_shift_rows.append(
                     weight * (self.means_[idx] - chunk_means[idx])
                 )
@@ -845,34 +887,24 @@ class LinearDiscriminantAnalysis(
             self._class_counts[idx] = N_new
 
         # --- Center chunk by local class means ---
-        Xc = np.empty_like(X)
+        Xc = xp.zeros_like(X)
         for idx, c in enumerate(self.classes_):
             mask = y == c
-            if np.any(mask):
+            if xp.any(mask):
                 Xc[mask] = X[mask] - chunk_means[idx]
 
-        # --- Build block matrix Z (pre-allocated) ---
+        # --- Build block matrix Z via concat ---
         rank_old = self._unscaled_S.shape[0]
-        n_correction = len(mean_shift_rows)
-        n_rows = rank_old + n_samples + n_correction
-        Z = np.empty((n_rows, n_features), dtype=X.dtype)
-
-        offset = 0
+        blocks = []
         if rank_old > 0:
-            np.multiply(
-                self._unscaled_S[:, None], self._unscaled_Vt,
-                out=Z[:rank_old]
-            )
-            offset = rank_old
-        Z[offset:offset + n_samples] = Xc
-        offset += n_samples
-        for i, row in enumerate(mean_shift_rows):
-            Z[offset + i] = row
+            blocks.append(self._unscaled_S[:, None] * self._unscaled_Vt)
+        blocks.append(Xc)
+        if mean_shift_rows:
+            blocks.append(xp.stack(mean_shift_rows))
+        Z = xp.concat(blocks, axis=0)
 
         # --- SVD of block matrix ---
-        _, S_new, Vt_new = scipy.linalg.svd(
-            Z, full_matrices=False, check_finite=False
-        )
+        _, S_new, Vt_new = svd(Z)
 
         # Truncate negligible components
         keep = S_new > self.tol
@@ -880,17 +912,21 @@ class LinearDiscriminantAnalysis(
         self._unscaled_Vt = Vt_new[keep]
 
         # --- Early return if fewer than 2 classes seen or insufficient df ---
-        n_classes_seen = np.count_nonzero(self._class_counts)
+        n_classes_seen = int(
+            xp.sum(xp.astype(self._class_counts != 0, xp.int64))
+        )
         N_total = self._class_counts.sum()
         if n_classes_seen < 2 or N_total <= n_classes_seen:
             return
 
         # --- Derive priors (cheap, needed by tests and _reconstruct) ---
         if self.priors is not None:
-            self.priors_ = np.asarray(self.priors, dtype=np.float64)
-            if np.any(self.priors_ < 0):
+            self.priors_ = xp.asarray(
+                self.priors, dtype=xp.float64, device=device_
+            )
+            if xp.any(self.priors_ < 0):
                 raise ValueError("priors must be non-negative")
-            if np.abs(np.sum(self.priors_) - 1.0) > 1e-5:
+            if float(xp.abs(xp.sum(self.priors_) - 1.0)) > 1e-5:
                 warnings.warn(
                     "The priors do not sum to 1. Renormalizing",
                     UserWarning,
@@ -1072,6 +1108,8 @@ class LinearDiscriminantAnalysis(
                     "covariance_estimator. Use a float shrinkage value or None."
                 )
 
+        xp, _, device_ = get_namespace_and_device(X)
+
         first_call = _check_partial_fit_first_call(self, classes)
 
         X, y = validate_data(
@@ -1079,12 +1117,12 @@ class LinearDiscriminantAnalysis(
             X,
             y,
             ensure_min_samples=1,
-            dtype=[np.float64, np.float32],
+            dtype=[xp.float64, xp.float32],
             reset=first_call,
         )
 
         # Validate that y contains only known classes
-        unexpected = np.setdiff1d(y, self.classes_)
+        unexpected = xpx.setdiff1d(y, self.classes_, xp=xp)
         if len(unexpected) > 0:
             raise ValueError(
                 f"The target label(s) {unexpected} in y do not exist "
@@ -1093,7 +1131,7 @@ class LinearDiscriminantAnalysis(
 
         # Route to solver-specific method
         if self.solver == "svd":
-            self._partial_fit_svd(X, y, first_call)
+            self._partial_fit_svd(X, y, first_call, xp, device_)
         else:
             self._partial_fit_covariance(X, y, first_call)
 
