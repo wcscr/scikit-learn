@@ -659,11 +659,134 @@ class LinearDiscriminantAnalysis(
         self.coef_ = coef @ self.scalings_.T
         self.intercept_ -= self.xbar_ @ self.coef_.T
 
+    # Attributes lazily reconstructed from the compact SVD factorization.
+    # Accessing any of these triggers _reconstruct_svd_attrs() when stale.
+    _SVD_LAZY_ATTRS = frozenset(
+        {
+            "coef_",
+            "intercept_",
+            "scalings_",
+            "xbar_",
+            "explained_variance_ratio_",
+        }
+    )
+
+    def __getattr__(self, name):
+        if name in LinearDiscriminantAnalysis._SVD_LAZY_ATTRS:
+            if self.__dict__.get("_svd_attrs_stale", False):
+                self._ensure_svd_attrs()
+                return self.__dict__[name]
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
+    def _invalidate_svd_attrs(self):
+        """Delete cached prediction attributes and mark them as stale."""
+        for attr in self._SVD_LAZY_ATTRS:
+            self.__dict__.pop(attr, None)
+        self._svd_attrs_stale = True
+
+    def _ensure_svd_attrs(self):
+        """Reconstruct prediction attributes from compact SVD if stale."""
+        if getattr(self, "_svd_attrs_stale", False):
+            self._reconstruct_svd_attrs()
+
+    def _reconstruct_svd_attrs(self):
+        """Derive public prediction attributes from compact SVD factors.
+
+        Computes scalings_, coef_, intercept_, xbar_, and
+        explained_variance_ratio_ from the stored (S, Vt) factorization.
+        This is separated from _partial_fit_svd so that it can be deferred
+        until prediction time, avoiding redundant work during streaming.
+
+        Assumes priors_ and _max_components are already set by
+        _partial_fit_svd.
+        """
+        n_classes = len(self.classes_)
+        n_classes_seen = np.count_nonzero(self._class_counts)
+        N_total = self._class_counts.sum()
+
+        # --- Reconstruct public attributes from compact SVD ---
+        # Compute within-class std without materializing full S*Vt matrix:
+        # std[j] = sqrt(sum_i (S[i] * Vt[i,j])^2 / N_total)
+        #        = sqrt((S^2 @ Vt^2) / N_total)
+        std = np.sqrt(
+            (self._unscaled_S**2) @ (self._unscaled_Vt**2) / N_total
+        )
+        std[std == 0] = 1.0
+
+        # Within-class scaling (equivalent to batch _solve_svd)
+        fac = 1.0 / (N_total - n_classes_seen)
+        SVt = self._unscaled_S[:, None] * self._unscaled_Vt
+        scaled = np.sqrt(fac) * (SVt / std)
+        _, S_scaled, Vt_scaled = scipy.linalg.svd(
+            scaled, full_matrices=False, check_finite=False
+        )
+
+        rank = np.sum(S_scaled > self.tol)
+        if rank == 0:
+            rank = 1  # ensure at least one component
+        scalings = (Vt_scaled[:rank, :] / std).T / S_scaled[:rank]
+
+        # Between-class scaling
+        self.xbar_ = self.priors_ @ self.means_
+        fac_between = 1.0 if n_classes == 1 else 1.0 / (n_classes - 1)
+        X_between = (
+            (np.sqrt((N_total * self.priors_) * fac_between))
+            * (self.means_ - self.xbar_).T
+        ).T @ scalings
+
+        _, S_between, Vt_between = scipy.linalg.svd(
+            X_between, full_matrices=False, check_finite=False
+        )
+
+        if self._max_components == 0:
+            self.explained_variance_ratio_ = np.empty(
+                (0,), dtype=S_between.dtype
+            )
+        else:
+            s2_sum = np.sum(S_between**2)
+            if s2_sum > 0:
+                self.explained_variance_ratio_ = (
+                    S_between**2 / s2_sum
+                )[: self._max_components]
+            else:
+                self.explained_variance_ratio_ = np.zeros(
+                    min(len(S_between), self._max_components),
+                    dtype=S_between.dtype,
+                )
+
+        if len(S_between) > 0:
+            rank_between = np.sum(S_between > self.tol * S_between[0])
+        else:
+            rank_between = 0
+        if rank_between == 0:
+            rank_between = 1
+        self.scalings_ = scalings @ Vt_between.T[:, :rank_between]
+        coef = (self.means_ - self.xbar_) @ self.scalings_
+        self.intercept_ = (
+            -0.5 * np.sum(coef**2, axis=1) + np.log(self.priors_)
+        )
+        self.coef_ = coef @ self.scalings_.T
+        self.intercept_ -= self.xbar_ @ self.coef_.T
+
+        # Binary case: reduce to 1D output (moved from partial_fit)
+        if len(self.classes_) == 2:
+            self.coef_ = (self.coef_[1, :] - self.coef_[0, :])[np.newaxis, :]
+            self.intercept_ = np.array(
+                [self.intercept_[1] - self.intercept_[0]]
+            )
+
+        self._n_features_out = self._max_components
+        self._svd_attrs_stale = False
+
     def _partial_fit_svd(self, X, y, first_call):
         """Incremental SVD update for partial_fit.
 
         Maintains a compact SVD factorization (S, Vt) of all within-class
         centered data seen so far, avoiding O(D^2) covariance storage.
+        Model attributes (coef_, intercept_, scalings_, etc.) are computed
+        lazily on first access after this method returns.
 
         Parameters
         ----------
@@ -676,7 +799,7 @@ class LinearDiscriminantAnalysis(
         first_call : bool
             Whether this is the first call to partial_fit.
         """
-        n_features = X.shape[1]
+        n_samples, n_features = X.shape
         n_classes = len(self.classes_)
 
         # --- Initialize streaming state ---
@@ -728,17 +851,28 @@ class LinearDiscriminantAnalysis(
             if np.any(mask):
                 Xc[mask] = X[mask] - chunk_means[idx]
 
-        # --- Build block matrix Z ---
-        blocks = []
-        if self._unscaled_S.size > 0:
-            blocks.append(self._unscaled_S[:, None] * self._unscaled_Vt)
-        blocks.append(Xc)
-        if mean_shift_rows:
-            blocks.append(np.array(mean_shift_rows))
-        Z = np.vstack(blocks)
+        # --- Build block matrix Z (pre-allocated) ---
+        rank_old = self._unscaled_S.shape[0]
+        n_correction = len(mean_shift_rows)
+        n_rows = rank_old + n_samples + n_correction
+        Z = np.empty((n_rows, n_features), dtype=X.dtype)
+
+        offset = 0
+        if rank_old > 0:
+            np.multiply(
+                self._unscaled_S[:, None], self._unscaled_Vt,
+                out=Z[:rank_old]
+            )
+            offset = rank_old
+        Z[offset:offset + n_samples] = Xc
+        offset += n_samples
+        for i, row in enumerate(mean_shift_rows):
+            Z[offset + i] = row
 
         # --- SVD of block matrix ---
-        _, S_new, Vt_new = scipy.linalg.svd(Z, full_matrices=False)
+        _, S_new, Vt_new = scipy.linalg.svd(
+            Z, full_matrices=False, check_finite=False
+        )
 
         # Truncate negligible components
         keep = S_new > self.tol
@@ -751,8 +885,7 @@ class LinearDiscriminantAnalysis(
         if n_classes_seen < 2 or N_total <= n_classes_seen:
             return
 
-        # --- Derive priors ---
-        N_total = self._class_counts.sum()
+        # --- Derive priors (cheap, needed by tests and _reconstruct) ---
         if self.priors is not None:
             self.priors_ = np.asarray(self.priors, dtype=np.float64)
             if np.any(self.priors_ < 0):
@@ -766,7 +899,7 @@ class LinearDiscriminantAnalysis(
         else:
             self.priors_ = self._class_counts / N_total
 
-        # --- Maximum number of components ---
+        # --- Maximum number of components (cheap) ---
         max_components = min(n_classes - 1, n_features)
         if self.n_components is None:
             self._max_components = max_components
@@ -777,67 +910,10 @@ class LinearDiscriminantAnalysis(
                     "min(n_features, n_classes - 1)."
                 )
             self._max_components = self.n_components
+        self._n_features_out = self._max_components
 
-        # --- Reconstruct public attributes from compact SVD ---
-        # Reconstruct within-class std from the SVD factors
-        # std[j] = sqrt(sum_i (S[i] * Vt[i,j])^2 / N_total)
-        SVt = self._unscaled_S[:, None] * self._unscaled_Vt
-        std = np.sqrt(np.sum(SVt**2, axis=0) / N_total)
-        std[std == 0] = 1.0
-
-        # Within-class scaling (equivalent to batch _solve_svd)
-        fac = 1.0 / (N_total - n_classes_seen)
-        scaled = np.sqrt(fac) * (SVt / std)
-        _, S_scaled, Vt_scaled = scipy.linalg.svd(
-            scaled, full_matrices=False
-        )
-
-        rank = np.sum(S_scaled > self.tol)
-        if rank == 0:
-            rank = 1  # ensure at least one component
-        scalings = (Vt_scaled[:rank, :] / std).T / S_scaled[:rank]
-
-        # Between-class scaling
-        self.xbar_ = self.priors_ @ self.means_
-        fac_between = 1.0 if n_classes == 1 else 1.0 / (n_classes - 1)
-        X_between = (
-            (np.sqrt((N_total * self.priors_) * fac_between))
-            * (self.means_ - self.xbar_).T
-        ).T @ scalings
-
-        _, S_between, Vt_between = scipy.linalg.svd(
-            X_between, full_matrices=False
-        )
-
-        if self._max_components == 0:
-            self.explained_variance_ratio_ = np.empty(
-                (0,), dtype=S_between.dtype
-            )
-        else:
-            s2_sum = np.sum(S_between**2)
-            if s2_sum > 0:
-                self.explained_variance_ratio_ = (
-                    S_between**2 / s2_sum
-                )[: self._max_components]
-            else:
-                self.explained_variance_ratio_ = np.zeros(
-                    min(len(S_between), self._max_components),
-                    dtype=S_between.dtype,
-                )
-
-        if len(S_between) > 0:
-            rank_between = np.sum(S_between > self.tol * S_between[0])
-        else:
-            rank_between = 0
-        if rank_between == 0:
-            rank_between = 1
-        self.scalings_ = scalings @ Vt_between.T[:, :rank_between]
-        coef = (self.means_ - self.xbar_) @ self.scalings_
-        self.intercept_ = (
-            -0.5 * np.sum(coef**2, axis=1) + np.log(self.priors_)
-        )
-        self.coef_ = coef @ self.scalings_.T
-        self.intercept_ -= self.xbar_ @ self.coef_.T
+        # --- Mark expensive model attributes as stale (deferred) ---
+        self._invalidate_svd_attrs()
 
     @_fit_context(
         # LinearDiscriminantAnalysis.covariance_estimator is not validated yet
@@ -1021,15 +1097,19 @@ class LinearDiscriminantAnalysis(
         else:
             self._partial_fit_covariance(X, y, first_call)
 
-        # Binary case: reduce to 1D output
-        if hasattr(self, "coef_") and len(self.classes_) == 2:
-            self.coef_ = (self.coef_[1, :] - self.coef_[0, :])[np.newaxis, :]
-            self.intercept_ = np.array(
-                [self.intercept_[1] - self.intercept_[0]]
-            )
+            # Binary case: reduce to 1D output (SVD handles this lazily
+            # in _reconstruct_svd_attrs)
+            if hasattr(self, "coef_") and len(self.classes_) == 2:
+                self.coef_ = (
+                    self.coef_[1, :] - self.coef_[0, :]
+                )[np.newaxis, :]
+                self.intercept_ = np.array(
+                    [self.intercept_[1] - self.intercept_[0]]
+                )
 
-        if hasattr(self, "_max_components"):
-            self._n_features_out = self._max_components
+            if hasattr(self, "_max_components"):
+                self._n_features_out = self._max_components
+
         return self
 
     def _partial_fit_covariance(self, X, y, first_call):
@@ -1167,7 +1247,11 @@ class LinearDiscriminantAnalysis(
 
     def __sklearn_is_fitted__(self):
         """Check fitted status by verifying solver output exists."""
-        return hasattr(self, "coef_")
+        # For SVD streaming: attrs are lazily reconstructed, but the model
+        # is fitted once we have sufficient statistics.
+        if self.__dict__.get("_svd_attrs_stale", False):
+            return True
+        return "coef_" in self.__dict__
 
     def transform(self, X):
         """Project data to maximize class separation.
@@ -1189,6 +1273,7 @@ class LinearDiscriminantAnalysis(
                 "transform not implemented for 'lsqr' solver (use 'svd' or 'eigen')."
             )
         check_is_fitted(self)
+        self._ensure_svd_attrs()
         X = validate_data(self, X, reset=False)
 
         if self.solver == "svd":
