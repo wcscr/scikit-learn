@@ -717,7 +717,7 @@ class LinearDiscriminantAnalysis(
         n_classes_seen = int(
             xp.sum(xp.astype(self._class_counts != 0, xp.int64))
         )
-        N_total = self._class_counts.sum()
+        N_total = float(self._class_counts.sum())
 
         if _is_numpy_namespace(xp):
             svd = lambda M: scipy.linalg.svd(
@@ -725,6 +725,12 @@ class LinearDiscriminantAnalysis(
             )
         else:
             svd = lambda M: xp.linalg.svd(M, full_matrices=False)
+
+        # Work in the SVD factors' dtype (matches X.dtype from training)
+        # to keep all matmuls dtype-consistent (required by PyTorch).
+        working_dtype = self._unscaled_S.dtype
+        means = xp.astype(self.means_, working_dtype)
+        priors = xp.astype(self.priors_, working_dtype)
 
         # --- Reconstruct public attributes from compact SVD ---
         # Compute within-class std without materializing full S*Vt matrix:
@@ -736,7 +742,10 @@ class LinearDiscriminantAnalysis(
         std[std == 0] = 1.0
 
         # Within-class scaling (equivalent to batch _solve_svd)
-        fac = 1.0 / (N_total - n_classes_seen)
+        fac = xp.asarray(
+            1.0 / (N_total - n_classes_seen),
+            dtype=working_dtype, device=device_,
+        )
         SVt = self._unscaled_S[:, None] * self._unscaled_Vt
         scaled = xp.sqrt(fac) * (SVt / std)
         _, S_scaled, Vt_scaled = svd(scaled)
@@ -747,11 +756,11 @@ class LinearDiscriminantAnalysis(
         scalings = (Vt_scaled[:rank, :] / std).T / S_scaled[:rank]
 
         # Between-class scaling
-        self.xbar_ = self.priors_ @ self.means_
+        self.xbar_ = priors @ means
         fac_between = 1.0 if n_classes == 1 else 1.0 / (n_classes - 1)
         X_between = (
-            (xp.sqrt((N_total * self.priors_) * fac_between))
-            * (self.means_ - self.xbar_).T
+            (xp.sqrt((N_total * priors) * fac_between))
+            * (means - self.xbar_).T
         ).T @ scalings
 
         _, S_between, Vt_between = svd(X_between)
@@ -782,9 +791,9 @@ class LinearDiscriminantAnalysis(
         if rank_between == 0:
             rank_between = 1
         self.scalings_ = scalings @ Vt_between.T[:, :rank_between]
-        coef = (self.means_ - self.xbar_) @ self.scalings_
+        coef = (means - self.xbar_) @ self.scalings_
         self.intercept_ = (
-            -0.5 * xp.sum(coef**2, axis=1) + xp.log(self.priors_)
+            -0.5 * xp.sum(coef**2, axis=1) + xp.log(priors)
         )
         self.coef_ = coef @ self.scalings_.T
         self.intercept_ -= self.xbar_ @ self.coef_.T
@@ -839,6 +848,8 @@ class LinearDiscriminantAnalysis(
             svd = lambda M: xp.linalg.svd(M, full_matrices=False)
 
         # --- Initialize streaming state ---
+        # Accumulators use float64 for running-mean stability.
+        # SVD factors (_unscaled_S/Vt) use X.dtype to match batch _solve_svd.
         if first_call or not hasattr(self, "_unscaled_S"):
             self._class_counts = xp.zeros(
                 n_classes, dtype=xp.float64, device=device_
@@ -846,9 +857,9 @@ class LinearDiscriminantAnalysis(
             self.means_ = xp.zeros(
                 (n_classes, n_features), dtype=xp.float64, device=device_
             )
-            self._unscaled_S = xp.zeros(0, dtype=xp.float64, device=device_)
+            self._unscaled_S = xp.zeros(0, dtype=X.dtype, device=device_)
             self._unscaled_Vt = xp.zeros(
-                (0, n_features), dtype=xp.float64, device=device_
+                (0, n_features), dtype=X.dtype, device=device_
             )
 
         # --- Per-chunk: compute local stats ---
@@ -887,11 +898,14 @@ class LinearDiscriminantAnalysis(
             self._class_counts[idx] = N_new
 
         # --- Center chunk by local class means ---
+        # Cast chunk_means to X.dtype; accumulators are float64 for stability
+        # but centered data and SVD factors use the input dtype.
+        chunk_means_x = xp.astype(chunk_means, X.dtype)
         Xc = xp.zeros_like(X)
         for idx, c in enumerate(self.classes_):
             mask = y == c
             if xp.any(mask):
-                Xc[mask] = X[mask] - chunk_means[idx]
+                Xc[mask] = X[mask] - chunk_means_x[idx]
 
         # --- Build block matrix Z via concat ---
         rank_old = self._unscaled_S.shape[0]
@@ -900,7 +914,8 @@ class LinearDiscriminantAnalysis(
             blocks.append(self._unscaled_S[:, None] * self._unscaled_Vt)
         blocks.append(Xc)
         if mean_shift_rows:
-            blocks.append(xp.stack(mean_shift_rows))
+            # Cast mean-shift rows to X.dtype for consistent block matrix
+            blocks.append(xp.astype(xp.stack(mean_shift_rows), X.dtype))
         Z = xp.concat(blocks, axis=0)
 
         # --- SVD of block matrix ---
