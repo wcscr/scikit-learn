@@ -668,6 +668,7 @@ class LinearDiscriminantAnalysis(
             "scalings_",
             "xbar_",
             "explained_variance_ratio_",
+            "covariance_",
         }
     )
 
@@ -675,7 +676,8 @@ class LinearDiscriminantAnalysis(
         if name in LinearDiscriminantAnalysis._SVD_LAZY_ATTRS:
             if self.__dict__.get("_svd_attrs_stale", False):
                 self._ensure_svd_attrs()
-                return self.__dict__[name]
+                if name in self.__dict__:
+                    return self.__dict__[name]
         raise AttributeError(
             f"'{type(self).__name__}' object has no attribute '{name}'"
         )
@@ -685,6 +687,24 @@ class LinearDiscriminantAnalysis(
         for attr in self._SVD_LAZY_ATTRS:
             self.__dict__.pop(attr, None)
         self._svd_attrs_stale = True
+
+    def _clear_prediction_attrs(self):
+        """Remove prediction attributes so the estimator becomes unfitted.
+
+        Called during reinit to prevent stale fitted attributes from
+        surviving a reset of the streaming accumulators.
+        """
+        for attr in (
+            "coef_",
+            "intercept_",
+            "scalings_",
+            "xbar_",
+            "explained_variance_ratio_",
+            "covariance_",
+            "_n_features_out",
+        ):
+            self.__dict__.pop(attr, None)
+        self._svd_attrs_stale = False
 
     def _ensure_svd_attrs(self):
         """Reconstruct prediction attributes from compact SVD if stale."""
@@ -713,7 +733,13 @@ class LinearDiscriminantAnalysis(
         std = np.sqrt(
             (self._unscaled_S**2) @ (self._unscaled_Vt**2) / N_total
         )
-        std[std < self.tol] = 1.0
+        # Use scale-relative floor instead of absolute self.tol
+        std_max = std.max() if std.size > 0 else 0.0
+        if std_max == 0:
+            std[:] = 1.0
+        else:
+            std_floor = np.sqrt(np.finfo(std.dtype).eps) * std_max
+            std[std <= std_floor] = 1.0
 
         # Within-class scaling (equivalent to batch _solve_svd)
         fac = 1.0 / (N_total - n_classes_seen)
@@ -777,6 +803,11 @@ class LinearDiscriminantAnalysis(
                 [self.intercept_[1] - self.intercept_[0]]
             )
 
+        # Compute pooled within-class covariance if requested
+        if self.store_covariance:
+            SVt = self._unscaled_S[:, None] * self._unscaled_Vt
+            self.covariance_ = (SVt.T @ SVt) / N_total
+
         self._n_features_out = self._max_components
         self._svd_attrs_stale = False
 
@@ -804,6 +835,7 @@ class LinearDiscriminantAnalysis(
 
         # --- Initialize streaming state ---
         if first_call or not hasattr(self, "_unscaled_S"):
+            self._clear_prediction_attrs()
             self._class_counts = np.zeros(n_classes, dtype=np.float64)
             self.means_ = np.zeros((n_classes, n_features), dtype=np.float64)
             self._unscaled_S = np.empty(0, dtype=np.float64)
@@ -874,15 +906,20 @@ class LinearDiscriminantAnalysis(
             Z, full_matrices=False, check_finite=False
         )
 
-        # Truncate negligible components
-        keep = S_new > self.tol
+        # Truncate negligible components using relative rank filtering
+        # (scale-independent, unlike absolute self.tol)
+        if S_new.size > 0:
+            eps = np.finfo(Z.dtype).eps
+            keep = S_new > eps * max(Z.shape) * S_new[0]
+        else:
+            keep = np.array([], dtype=bool)
         self._unscaled_S = S_new[keep]
         self._unscaled_Vt = Vt_new[keep]
 
-        # --- Early return if fewer than 2 classes seen or insufficient df ---
+        # --- Early return if not all classes seen or insufficient df ---
         n_classes_seen = np.count_nonzero(self._class_counts)
         N_total = self._class_counts.sum()
-        if n_classes_seen < 2 or N_total <= n_classes_seen:
+        if n_classes_seen < n_classes or N_total <= n_classes_seen:
             return
 
         # --- Derive priors (cheap, needed by tests and _reconstruct) ---
@@ -1050,10 +1087,16 @@ class LinearDiscriminantAnalysis(
 
         Notes
         -----
-        The estimator is not usable for prediction until all classes have
-        been observed and sufficient samples have been accumulated (at
-        least ``n_classes`` total samples for the ``eigen`` solver).
-        Until then, calling ``predict`` will raise ``NotFittedError``.
+        The estimator is not usable for prediction until **all** declared
+        classes (passed via ``classes`` on the first call) have been
+        observed in at least one chunk. Additionally the ``eigen`` solver
+        requires at least ``n_features`` within-class degrees of freedom.
+        Until these conditions are met, calling ``predict`` will raise
+        ``NotFittedError``.
+
+        When ``store_covariance=True`` and ``solver="svd"``, the pooled
+        within-class covariance matrix is reconstructed from the compact
+        SVD factorization at prediction time.
 
         References
         ----------
@@ -1106,7 +1149,10 @@ class LinearDiscriminantAnalysis(
 
             # Binary case: reduce to 1D output (SVD handles this lazily
             # in _reconstruct_svd_attrs)
-            if hasattr(self, "coef_") and len(self.classes_) == 2:
+            if (
+                hasattr(self, "coef_")
+                and self.coef_.shape[0] == len(self.classes_) == 2
+            ):
                 self.coef_ = (
                     self.coef_[1, :] - self.coef_[0, :]
                 )[np.newaxis, :]
@@ -1142,6 +1188,7 @@ class LinearDiscriminantAnalysis(
         if first_call or not hasattr(self, "_class_counts"):
             # Reinitialize accumulators on first call or after a prior
             # fit() call which does not set these private attributes.
+            self._clear_prediction_attrs()
             self._class_counts = np.zeros(n_classes, dtype=np.float64)
             self.means_ = np.zeros(
                 (n_classes, n_features), dtype=np.float64
@@ -1190,12 +1237,12 @@ class LinearDiscriminantAnalysis(
         else:
             self.priors_ = self._class_counts / N_total
 
-        # Cannot solve until at least 2 classes have been observed.
+        # Cannot solve until all declared classes have been observed.
         # For the eigen solver, also require enough within-class degrees
         # of freedom for a non-singular covariance matrix.
         n_classes_seen = np.count_nonzero(self._class_counts)
         within_df = N_total - n_classes_seen
-        if n_classes_seen < 2 or (
+        if n_classes_seen < n_classes or (
             self.solver == "eigen" and within_df < n_features
         ):
             return

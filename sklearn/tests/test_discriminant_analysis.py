@@ -1210,8 +1210,46 @@ def test_lda_svd_partial_fit_collinear():
     assert_array_equal(clf_online.predict(X_full), clf_batch.predict(X_full))
 
 
-def test_lda_svd_partial_fit_no_covariance():
-    """SVD partial_fit does not set covariance_ even with store_covariance=True."""
+def test_lda_svd_partial_fit_store_covariance():
+    """SVD partial_fit with store_covariance=True produces correct covariance_."""
+    X_full, y_full = make_classification(
+        n_samples=200,
+        n_features=4,
+        n_informative=4,
+        n_redundant=0,
+        n_classes=2,
+        random_state=42,
+    )
+
+    # Batch reference with store_covariance
+    clf_batch = LinearDiscriminantAnalysis(solver="svd", store_covariance=True)
+    clf_batch.fit(X_full, y_full)
+
+    # Streaming with store_covariance
+    clf_online = LinearDiscriminantAnalysis(solver="svd", store_covariance=True)
+    classes = np.unique(y_full)
+    chunk_size = 50
+    for i in range(0, len(X_full), chunk_size):
+        clf_online.partial_fit(
+            X_full[i : i + chunk_size],
+            y_full[i : i + chunk_size],
+            classes=classes if i == 0 else None,
+        )
+
+    assert hasattr(clf_online, "covariance_")
+    assert_allclose(clf_online.covariance_, clf_batch.covariance_, atol=1e-10)
+
+    # Without store_covariance, covariance_ should not be set
+    clf_no_cov = LinearDiscriminantAnalysis(solver="svd", store_covariance=False)
+    clf_no_cov.partial_fit(X_full, y_full, classes=classes)
+    assert not hasattr(clf_no_cov, "covariance_")
+
+
+@pytest.mark.parametrize("solver", ["eigen", "lsqr", "svd"])
+def test_lda_partial_fit_after_fit_one_class_chunk(solver):
+    """fit() then partial_fit() with one-class chunk must not crash."""
+    from sklearn.exceptions import NotFittedError
+
     X_full, y_full = make_classification(
         n_samples=100,
         n_features=4,
@@ -1220,9 +1258,115 @@ def test_lda_svd_partial_fit_no_covariance():
         n_classes=2,
         random_state=42,
     )
-
-    clf = LinearDiscriminantAnalysis(solver="svd", store_covariance=True)
     classes = np.unique(y_full)
-    clf.partial_fit(X_full, y_full, classes=classes)
 
-    assert not hasattr(clf, "covariance_")
+    clf = LinearDiscriminantAnalysis(solver=solver)
+    clf.fit(X_full, y_full)
+
+    # partial_fit with only one class => reinit + early return => unfitted
+    X_one = X_full[:5]
+    y_one = np.full(5, classes[0])
+    clf.partial_fit(X_one, y_one)
+
+    with pytest.raises(NotFittedError):
+        clf.predict(X_full)
+
+
+@pytest.mark.parametrize("solver", ["eigen", "lsqr", "svd"])
+def test_lda_partial_fit_multiclass_not_fitted_until_all_seen(solver):
+    """Multiclass partial_fit: unfitted until all declared classes observed."""
+    from sklearn.exceptions import NotFittedError
+
+    rng = np.random.RandomState(42)
+    n_features = 4
+    classes = np.array([0, 1, 2])
+
+    clf = LinearDiscriminantAnalysis(solver=solver)
+
+    # Feed only classes 0 and 1
+    X_01 = rng.randn(40, n_features)
+    y_01 = np.array([0, 1] * 20)
+    clf.partial_fit(X_01, y_01, classes=classes)
+
+    with pytest.raises(NotFittedError):
+        clf.predict(X_01)
+
+    # Now feed class 2 => should become fitted
+    X_2 = rng.randn(20, n_features) + 3
+    y_2 = np.full(20, 2)
+    clf.partial_fit(X_2, y_2)
+
+    predictions = clf.predict(X_01)
+    assert predictions.shape == (40,)
+
+
+def test_lda_svd_partial_fit_scale_invariance():
+    """SVD partial_fit handles features with very different scales."""
+    rng = np.random.RandomState(42)
+    n_samples = 300
+    # Features at vastly different scales
+    X = np.column_stack(
+        [
+            rng.randn(n_samples) * 1.0,
+            rng.randn(n_samples) * 1e-4,
+            rng.randn(n_samples) * 1e-6,
+        ]
+    )
+    y = (X[:, 0] > 0).astype(int)
+
+    clf_batch = LinearDiscriminantAnalysis(solver="svd")
+    clf_batch.fit(X, y)
+
+    clf_online = LinearDiscriminantAnalysis(solver="svd")
+    classes = np.unique(y)
+    chunk_size = 50
+    for i in range(0, n_samples, chunk_size):
+        clf_online.partial_fit(
+            X[i : i + chunk_size],
+            y[i : i + chunk_size],
+            classes=classes if i == 0 else None,
+        )
+
+    pred_batch = clf_batch.predict(X)
+    pred_online = clf_online.predict(X)
+
+    # Predictions should be very similar
+    agreement = np.mean(pred_batch == pred_online)
+    assert agreement > 0.95, f"Prediction agreement {agreement:.2%} too low"
+
+
+def test_lda_svd_partial_fit_near_zero_variance():
+    """SVD partial_fit handles near-zero-variance and constant features."""
+    rng = np.random.RandomState(42)
+    n_samples = 200
+    X = np.column_stack(
+        [
+            rng.randn(n_samples),  # informative
+            rng.randn(n_samples) * 1e-15,  # near-zero variance
+            np.ones(n_samples) * 5.0,  # constant
+        ]
+    )
+    y = (X[:, 0] > 0).astype(int)
+
+    clf_batch = LinearDiscriminantAnalysis(solver="svd")
+    clf_batch.fit(X, y)
+
+    clf_online = LinearDiscriminantAnalysis(solver="svd")
+    classes = np.unique(y)
+    chunk_size = 50
+    for i in range(0, n_samples, chunk_size):
+        clf_online.partial_fit(
+            X[i : i + chunk_size],
+            y[i : i + chunk_size],
+            classes=classes if i == 0 else None,
+        )
+
+    # Should not blow up coefficients
+    assert np.all(np.isfinite(clf_online.coef_))
+    assert np.all(np.abs(clf_online.coef_) < 1e10)
+
+    # Predictions should match batch
+    pred_batch = clf_batch.predict(X)
+    pred_online = clf_online.predict(X)
+    agreement = np.mean(pred_batch == pred_online)
+    assert agreement > 0.95, f"Prediction agreement {agreement:.2%} too low"
