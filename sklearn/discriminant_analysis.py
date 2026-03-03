@@ -733,13 +733,8 @@ class LinearDiscriminantAnalysis(
         std = np.sqrt(
             (self._unscaled_S**2) @ (self._unscaled_Vt**2) / N_total
         )
-        # Use scale-relative floor instead of absolute self.tol
-        std_max = std.max() if std.size > 0 else 0.0
-        if std_max == 0:
-            std[:] = 1.0
-        else:
-            std_floor = np.sqrt(np.finfo(std.dtype).eps) * std_max
-            std[std <= std_floor] = 1.0
+        # Match batch _solve_svd: only clamp exact zeros
+        std[std == 0] = 1.0
 
         # Within-class scaling (equivalent to batch _solve_svd)
         fac = 1.0 / (N_total - n_classes_seen)

@@ -1327,23 +1327,24 @@ def test_lda_svd_partial_fit_scale_invariance():
             classes=classes if i == 0 else None,
         )
 
-    pred_batch = clf_batch.predict(X)
-    pred_online = clf_online.predict(X)
+    # Predictions must match exactly
+    assert_array_equal(clf_online.predict(X), clf_batch.predict(X))
 
-    # Predictions should be very similar
-    agreement = np.mean(pred_batch == pred_online)
-    assert agreement > 0.95, f"Prediction agreement {agreement:.2%} too low"
+    # Probabilities must be near-identical
+    proba_batch = clf_batch.predict_proba(X)
+    proba_online = clf_online.predict_proba(X)
+    assert_allclose(proba_online, proba_batch, atol=1e-10)
 
 
 def test_lda_svd_partial_fit_near_zero_variance():
-    """SVD partial_fit handles near-zero-variance and constant features."""
+    """SVD partial_fit handles low-variance and constant features."""
     rng = np.random.RandomState(42)
     n_samples = 200
     X = np.column_stack(
         [
             rng.randn(n_samples),  # informative
-            rng.randn(n_samples) * 1e-15,  # near-zero variance
-            np.ones(n_samples) * 5.0,  # constant
+            rng.randn(n_samples) * 1e-8,  # low variance
+            np.ones(n_samples) * 5.0,  # constant (exact zero variance)
         ]
     )
     y = (X[:, 0] > 0).astype(int)
@@ -1361,12 +1362,49 @@ def test_lda_svd_partial_fit_near_zero_variance():
             classes=classes if i == 0 else None,
         )
 
-    # Should not blow up coefficients
+    # Coefficients must be finite
     assert np.all(np.isfinite(clf_online.coef_))
-    assert np.all(np.abs(clf_online.coef_) < 1e10)
+    assert np.all(np.isfinite(clf_batch.coef_))
 
-    # Predictions should match batch
-    pred_batch = clf_batch.predict(X)
-    pred_online = clf_online.predict(X)
-    agreement = np.mean(pred_batch == pred_online)
-    assert agreement > 0.95, f"Prediction agreement {agreement:.2%} too low"
+    # Predictions must match batch exactly
+    assert_array_equal(clf_online.predict(X), clf_batch.predict(X))
+
+    # Probabilities must be near-identical
+    proba_batch = clf_batch.predict_proba(X)
+    proba_online = clf_online.predict_proba(X)
+    assert_allclose(proba_online, proba_batch, atol=1e-10)
+
+
+def test_lda_svd_partial_fit_tiny_nonzero_noise():
+    """Regression: tiny nonzero noise columns must match batch exactly."""
+    rng = np.random.RandomState(42)
+    n_samples = 200
+    X = np.column_stack(
+        [
+            rng.randn(n_samples),  # informative
+            rng.randn(n_samples) * 1e-8,  # tiny nonzero noise
+            rng.randn(n_samples) * 1e-9,  # even tinier noise
+        ]
+    )
+    y = (X[:, 0] > 0).astype(int)
+
+    clf_batch = LinearDiscriminantAnalysis(solver="svd")
+    clf_batch.fit(X, y)
+
+    clf_online = LinearDiscriminantAnalysis(solver="svd")
+    classes = np.unique(y)
+    chunk_size = 40
+    for i in range(0, n_samples, chunk_size):
+        clf_online.partial_fit(
+            X[i : i + chunk_size],
+            y[i : i + chunk_size],
+            classes=classes if i == 0 else None,
+        )
+
+    # Exact prediction parity
+    assert_array_equal(clf_online.predict(X), clf_batch.predict(X))
+
+    # Near-exact probability parity
+    proba_batch = clf_batch.predict_proba(X)
+    proba_online = clf_online.predict_proba(X)
+    assert_allclose(proba_online, proba_batch, atol=1e-10)
