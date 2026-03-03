@@ -593,6 +593,11 @@ class LinearDiscriminantAnalysis(
         std[std <= noise_floor] = 1.0
         return std
 
+    @staticmethod
+    def _svd_std_from_within_sum_sq(within_sum_sq, n_total):
+        """Compute stable within-class std from a sum-of-squares vector."""
+        return np.sqrt(np.maximum(within_sum_sq, 0.0) / n_total)
+
     def _solve_svd(self, X, y):
         """SVD solver.
 
@@ -735,14 +740,18 @@ class LinearDiscriminantAnalysis(
         N_total = self._class_counts.sum()
 
         # --- Reconstruct public attributes from compact SVD ---
-        # Compute within-class std without materializing full S*Vt matrix:
-        # std[j] = sqrt(sum_i (S[i] * Vt[i,j])^2 / N_total)
-        #        = sqrt((S^2 @ Vt^2) / N_total)
-        std = np.sqrt(
-            (self._unscaled_S**2) @ (self._unscaled_Vt**2) / N_total
+        # Use the exact within-class sum-of-squares accumulator (O(D) storage)
+        # instead of deriving std from truncated SVD factors, which loses
+        # variance from dropped singular components.
+        std = self._svd_std_from_within_sum_sq(self._within_sum_sq, N_total)
+        # Streaming accumulation of sum-of-squares produces floating-point
+        # noise that scales with sqrt(N_total). Use a wider noise floor than
+        # the batch path to reliably clamp constant-column noise to 1.0.
+        std_max = float(np.max(std)) if std.size > 0 else 1.0
+        noise_floor = (
+            np.sqrt(N_total) * np.finfo(np.float64).eps * max(std_max, 1.0)
         )
-        # Clamp near-zero std (floating-point noise from streaming accumulation)
-        std = self._clamp_svd_std(std)
+        std[std <= noise_floor] = 1.0
 
         # Within-class scaling (equivalent to batch _solve_svd)
         fac = 1.0 / (N_total - n_classes_seen)
@@ -845,17 +854,24 @@ class LinearDiscriminantAnalysis(
             self._unscaled_Vt = np.empty(
                 (0, n_features), dtype=np.float64
             )
+            # O(D) accumulator for exact within-class variance per feature.
+            # Avoids variance loss from SVD truncation of small singular values.
+            self._within_sum_sq = np.zeros(n_features, dtype=np.float64)
 
         # --- Per-chunk: compute local stats ---
         chunk_means = np.zeros((n_classes, n_features), dtype=np.float64)
         chunk_counts = np.zeros(n_classes, dtype=np.float64)
+        chunk_sum_sq = np.zeros((n_classes, n_features), dtype=np.float64)
         for idx, c in enumerate(self.classes_):
             mask = y == c
             m_k = np.sum(mask)
             if m_k > 0:
-                chunk_means[idx] = np.mean(X[mask], axis=0)
+                Xg = X[mask]
+                chunk_means[idx] = np.mean(Xg, axis=0)
                 chunk_counts[idx] = m_k
-
+                chunk_sum_sq[idx] = np.sum(
+                    (Xg - chunk_means[idx]) ** 2, axis=0
+                )
         # --- Compute mean-shift correction vectors (parallel axis theorem) ---
         mean_shift_rows = []
         for idx in range(n_classes):
@@ -867,6 +883,22 @@ class LinearDiscriminantAnalysis(
                 mean_shift_rows.append(
                     weight * (self.means_[idx] - chunk_means[idx])
                 )
+
+        # --- Update within-class sum-of-squares (Chan's parallel formula) ---
+        for idx in range(n_classes):
+            m_k = chunk_counts[idx]
+            if m_k == 0:
+                continue
+            N_old = self._class_counts[idx]
+            delta = chunk_means[idx] - self.means_[idx]
+            if N_old > 0:
+                N_new = N_old + m_k
+                self._within_sum_sq += (
+                    chunk_sum_sq[idx]
+                    + (N_old * m_k / N_new) * delta**2
+                )
+            else:
+                self._within_sum_sq += chunk_sum_sq[idx]
 
         # --- Update global means and counts ---
         for idx in range(n_classes):

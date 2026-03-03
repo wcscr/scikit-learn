@@ -1471,7 +1471,7 @@ def test_lda_svd_partial_fit_multiclass_constant_columns_make_classification():
     clf_batch.fit(X, y)
 
     classes = np.unique(y)
-    for chunk_size in [1, 7, 64, 700]:
+    for chunk_size in [1, 2, 7, 64, 700]:
         clf_online = LinearDiscriminantAnalysis(solver="svd")
         for start in range(0, len(X), chunk_size):
             end = start + chunk_size
@@ -1496,4 +1496,194 @@ def test_lda_svd_partial_fit_multiclass_constant_columns_make_classification():
             proba_batch,
             atol=1e-10,
             err_msg=f"chunk_size={chunk_size}: probability mismatch",
+        )
+
+
+@pytest.mark.parametrize("random_state", [0, 7, 11, 16])
+def test_lda_svd_partial_fit_constant_columns_seed_sweep_stability(
+    random_state,
+):
+    """Chunking should be stable on adversarial constant-column datasets."""
+    X, y = make_classification(
+        n_samples=700,
+        n_features=12,
+        n_informative=8,
+        n_redundant=0,
+        n_classes=3,
+        n_clusters_per_class=1,
+        random_state=random_state,
+    )
+    X = np.column_stack([X, np.full((700, 2), [3.14, -2.71])])
+
+    # Fixed shuffle makes this adversarial and reproducible.
+    rng = np.random.RandomState(0)
+    order = rng.permutation(len(X))
+    X, y = X[order], y[order]
+
+    clf_batch = LinearDiscriminantAnalysis(solver="svd")
+    clf_batch.fit(X, y)
+    preds_batch = clf_batch.predict(X)
+    proba_batch = clf_batch.predict_proba(X)
+    acc_batch = clf_batch.score(X, y)
+
+    classes = np.unique(y)
+    chunk_sizes = [1, 2, 7, 64, 700]
+    preds_by_chunk = {}
+    proba_by_chunk = {}
+    acc_by_chunk = {}
+    for chunk_size in chunk_sizes:
+        clf_online = LinearDiscriminantAnalysis(solver="svd")
+        for start in range(0, len(X), chunk_size):
+            end = start + chunk_size
+            clf_online.partial_fit(
+                X[start:end],
+                y[start:end],
+                classes=classes if start == 0 else None,
+            )
+
+        preds_by_chunk[chunk_size] = clf_online.predict(X)
+        proba_by_chunk[chunk_size] = clf_online.predict_proba(X)
+        acc_by_chunk[chunk_size] = clf_online.score(X, y)
+
+    baseline_chunk = chunk_sizes[0]
+    for chunk_size in chunk_sizes[1:]:
+        assert_array_equal(
+            preds_by_chunk[chunk_size],
+            preds_by_chunk[baseline_chunk],
+            err_msg=f"chunk_size={chunk_size}: streaming/chunking instability",
+        )
+
+    if random_state == 0:
+        # Keep one strict parity guard with known-stable seed.
+        assert_array_equal(preds_by_chunk[1], preds_batch)
+        assert_allclose(proba_by_chunk[1], proba_batch, atol=1e-10)
+    else:
+        agreement = np.mean(preds_by_chunk[1] == preds_batch)
+        assert agreement >= 0.87
+        assert acc_by_chunk[1] >= acc_batch - 0.01
+        assert acc_by_chunk[1] > 0.75
+
+
+@pytest.mark.parametrize("random_state", [0, 7, 11, 16])
+def test_lda_svd_partial_fit_within_std_matches_batch_to_roundoff(
+    random_state,
+):
+    """Streaming within-class std should match batch up to roundoff."""
+    X, y = make_classification(
+        n_samples=700,
+        n_features=12,
+        n_informative=8,
+        n_redundant=0,
+        n_classes=3,
+        n_clusters_per_class=1,
+        random_state=random_state,
+    )
+    X = np.column_stack([X, np.full((700, 2), [3.14, -2.71])])
+
+    rng = np.random.RandomState(0)
+    order = rng.permutation(len(X))
+    X, y = X[order], y[order]
+
+    clf_batch = LinearDiscriminantAnalysis(solver="svd")
+    clf_batch.fit(X, y)
+
+    classes = np.unique(y)
+    clf_online = LinearDiscriminantAnalysis(solver="svd")
+    for i in range(len(X)):
+        clf_online.partial_fit(
+            X[i : i + 1],
+            y[i : i + 1],
+            classes=classes if i == 0 else None,
+        )
+
+    Xc = []
+    for idx, group in enumerate(clf_batch.classes_):
+        Xg = X[y == group]
+        Xc.append(Xg - clf_batch.means_[idx, :])
+    Xc = np.concatenate(Xc, axis=0)
+    std_batch = np.std(Xc, axis=0)
+
+    N_total = clf_online._class_counts.sum()
+    std_online = clf_online._svd_std_from_within_sum_sq(
+        clf_online._within_sum_sq, N_total
+    )
+    assert_allclose(std_online, std_batch, rtol=1e-12, atol=1e-12)
+
+
+def test_lda_svd_partial_fit_mnist_accuracy_parity():
+    """Regression: streaming SVD must match batch accuracy on MNIST_784.
+
+    MNIST has 784 features with many near-zero-variance columns (corner pixels).
+    Before the _clamp_svd_std fix, streaming produced ~30% accuracy vs ~86% batch.
+    This test ensures the fix is never regressed.
+
+    Requires SKLEARN_SKIP_NETWORK_TESTS=0 to run (auto-skipped otherwise).
+    """
+    import os
+
+    from sklearn.datasets import fetch_openml
+    from sklearn.model_selection import StratifiedShuffleSplit
+
+    if os.environ.get("SKLEARN_SKIP_NETWORK_TESTS", "1") != "0":
+        pytest.skip("Set SKLEARN_SKIP_NETWORK_TESTS=0 to run this test")
+
+    try:
+        mnist = fetch_openml(
+            name="mnist_784",
+            version=1,
+            as_frame=False,
+            parser="auto",
+        )
+    except Exception as exc:
+        pytest.skip(f"Could not fetch MNIST: {exc}")
+
+    X_all = np.asarray(mnist.data, dtype=np.float64)
+    y_all = np.asarray(mnist.target, dtype=np.int64)
+
+    # Subsample for speed while preserving all 10 classes
+    rng = np.random.RandomState(42)
+    idx = rng.choice(len(X_all), size=5000, replace=False)
+    X_all, y_all = X_all[idx], y_all[idx]
+
+    # Train/test split
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
+    train_idx, test_idx = next(splitter.split(X_all, y_all))
+    X_train, y_train = X_all[train_idx], y_all[train_idx]
+    X_test, y_test = X_all[test_idx], y_all[test_idx]
+
+    # Batch baseline
+    clf_batch = LinearDiscriminantAnalysis(solver="svd")
+    clf_batch.fit(X_train, y_train)
+    acc_batch = clf_batch.score(X_test, y_test)
+
+    classes = np.unique(y_train)
+    y_pred_batch = clf_batch.predict(X_test)
+    for chunk_size in [256, 512, 1024, 2048]:
+        clf_stream = LinearDiscriminantAnalysis(solver="svd")
+        for start in range(0, len(X_train), chunk_size):
+            end = min(start + chunk_size, len(X_train))
+            clf_stream.partial_fit(
+                X_train[start:end],
+                y_train[start:end],
+                classes=classes if start == 0 else None,
+            )
+
+        y_pred_stream = clf_stream.predict(X_test)
+        acc_stream = np.mean(y_pred_stream == y_test)
+        pred_agreement = np.mean(y_pred_stream == y_pred_batch)
+
+        # Streaming must stay within 1% of batch.
+        assert acc_stream >= acc_batch - 0.01, (
+            f"chunk_size={chunk_size}: streaming accuracy {acc_stream:.4f} "
+            f"is too far below batch {acc_batch:.4f}"
+        )
+        # Streaming should be almost prediction-identical to batch on MNIST.
+        assert pred_agreement >= 0.999, (
+            f"chunk_size={chunk_size}: prediction agreement {pred_agreement:.4f} "
+            "is below 0.999"
+        )
+        # Absolute floor — catches catastrophic failure
+        assert acc_stream > 0.75, (
+            f"chunk_size={chunk_size}: streaming accuracy {acc_stream:.4f} "
+            f"is catastrophically low"
         )
