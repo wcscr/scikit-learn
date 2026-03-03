@@ -1446,3 +1446,54 @@ def test_lda_svd_partial_fit_multiclass_constant_columns():
     proba_batch = clf_batch.predict_proba(X)
     proba_online = clf_online.predict_proba(X)
     assert_allclose(proba_online, proba_batch, atol=1e-10)
+
+
+def test_lda_svd_partial_fit_multiclass_constant_columns_make_classification():
+    """Regression: make_classification data with appended constant columns.
+
+    Streaming SVD accumulation can produce near-zero (but non-zero) std for
+    truly constant columns due to floating-point noise. This must be clamped
+    identically to the batch path to avoid coefficient blow-ups.
+    """
+    X, y = make_classification(
+        n_samples=700,
+        n_features=12,
+        n_informative=8,
+        n_redundant=0,
+        n_classes=3,
+        n_clusters_per_class=1,
+        random_state=0,
+    )
+    # Append 2 exactly constant columns
+    X = np.column_stack([X, np.full((700, 2), [3.14, -2.71])])
+
+    clf_batch = LinearDiscriminantAnalysis(solver="svd")
+    clf_batch.fit(X, y)
+
+    classes = np.unique(y)
+    for chunk_size in [1, 7, 64, 700]:
+        clf_online = LinearDiscriminantAnalysis(solver="svd")
+        for start in range(0, len(X), chunk_size):
+            end = start + chunk_size
+            clf_online.partial_fit(
+                X[start:end],
+                y[start:end],
+                classes=classes if start == 0 else None,
+            )
+
+        preds_batch = clf_batch.predict(X)
+        preds_online = clf_online.predict(X)
+        assert_array_equal(
+            preds_online,
+            preds_batch,
+            err_msg=f"chunk_size={chunk_size}: prediction mismatch",
+        )
+
+        proba_batch = clf_batch.predict_proba(X)
+        proba_online = clf_online.predict_proba(X)
+        assert_allclose(
+            proba_online,
+            proba_batch,
+            atol=1e-10,
+            err_msg=f"chunk_size={chunk_size}: probability mismatch",
+        )

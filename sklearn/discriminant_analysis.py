@@ -585,6 +585,14 @@ class LinearDiscriminantAnalysis(
             self.priors_
         )
 
+    @staticmethod
+    def _clamp_svd_std(std):
+        """Clamp machine-noise std values to 1.0 for numerical stability."""
+        std_max = float(np.max(std))
+        noise_floor = np.finfo(np.float64).eps * max(std_max, 1.0)
+        std[std <= noise_floor] = 1.0
+        return std
+
     def _solve_svd(self, X, y):
         """SVD solver.
 
@@ -622,7 +630,7 @@ class LinearDiscriminantAnalysis(
         # 1) within (univariate) scaling by with classes std-dev
         std = xp.std(Xc, axis=0)
         # avoid division by zero in normalization
-        std[std == 0] = 1.0
+        std = self._clamp_svd_std(std)
         fac = xp.asarray(1.0 / (n_samples - n_classes), dtype=X.dtype, device=device(X))
 
         # 2) Within variance scaling
@@ -733,8 +741,8 @@ class LinearDiscriminantAnalysis(
         std = np.sqrt(
             (self._unscaled_S**2) @ (self._unscaled_Vt**2) / N_total
         )
-        # Match batch _solve_svd: only clamp exact zeros
-        std[std == 0] = 1.0
+        # Clamp near-zero std (floating-point noise from streaming accumulation)
+        std = self._clamp_svd_std(std)
 
         # Within-class scaling (equivalent to batch _solve_svd)
         fac = 1.0 / (N_total - n_classes_seen)
