@@ -20,7 +20,7 @@ from sklearn.base import (
 from sklearn.covariance import empirical_covariance, ledoit_wolf, shrunk_covariance
 from sklearn.linear_model._base import LinearClassifierMixin
 from sklearn.preprocessing import StandardScaler
-from sklearn.utils._array_api import _expit, device, get_namespace, size
+from sklearn.utils._array_api import _convert_to_numpy, _expit, device, get_namespace, size
 from sklearn.utils._param_validation import HasMethods, Interval, StrOptions
 from sklearn.utils.extmath import softmax
 from sklearn.utils.multiclass import (
@@ -1074,14 +1074,21 @@ class LinearDiscriminantAnalysis(
 
         first_call = _check_partial_fit_first_call(self, classes)
 
+        xp, is_array_api = get_namespace(X)
+
         X, y = validate_data(
             self,
             X,
             y,
             ensure_min_samples=1,
-            dtype=[np.float64, np.float32],
+            dtype=[xp.float64, xp.float32],
             reset=first_call,
         )
+
+        # Convert to NumPy for float64 accumulation in streaming path.
+        if is_array_api:
+            X = _convert_to_numpy(X, xp)
+            y = _convert_to_numpy(y, xp)
 
         # Validate that y contains only known classes
         unexpected = np.setdiff1d(y, self.classes_)
