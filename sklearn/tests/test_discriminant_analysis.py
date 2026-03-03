@@ -1408,3 +1408,41 @@ def test_lda_svd_partial_fit_tiny_nonzero_noise():
     proba_batch = clf_batch.predict_proba(X)
     proba_online = clf_online.predict_proba(X)
     assert_allclose(proba_online, proba_batch, atol=1e-10)
+
+
+def test_lda_svd_partial_fit_multiclass_constant_columns():
+    """Regression: 3-class data with exactly-constant columns must match batch."""
+    rng = np.random.RandomState(42)
+    n_per_class = 50
+    n_samples = 3 * n_per_class
+
+    # 3 informative features + 2 exactly constant columns
+    X_informative = rng.randn(n_samples, 3)
+    X_constant = np.full((n_samples, 2), [3.14, -2.71])
+    X = np.column_stack([X_informative, X_constant])
+    y = np.repeat([0, 1, 2], n_per_class)
+
+    # Shuffle with fixed seed for adversarial chunk ordering
+    perm = rng.permutation(n_samples)
+    X, y = X[perm], y[perm]
+
+    clf_batch = LinearDiscriminantAnalysis(solver="svd")
+    clf_batch.fit(X, y)
+
+    clf_online = LinearDiscriminantAnalysis(solver="svd")
+    classes = np.unique(y)
+    # chunk_size=1: worst case for accumulation drift
+    for i in range(n_samples):
+        clf_online.partial_fit(
+            X[i : i + 1],
+            y[i : i + 1],
+            classes=classes if i == 0 else None,
+        )
+
+    # Exact prediction parity
+    assert_array_equal(clf_online.predict(X), clf_batch.predict(X))
+
+    # Near-exact probability parity
+    proba_batch = clf_batch.predict_proba(X)
+    proba_online = clf_online.predict_proba(X)
+    assert_allclose(proba_online, proba_batch, atol=1e-10)
