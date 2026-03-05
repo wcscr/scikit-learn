@@ -11,8 +11,13 @@ if [ ! -f "/workspace/.venv-docker/pyvenv.cfg" ]; then
   . /workspace/.venv-docker/bin/activate
   pip install --upgrade pip setuptools wheel
   pip install "meson-python>=0.17.1" "cython>=3.1.2" "numpy>=2" "scipy>=1.10.0"
-  pip install torch --index-url https://download.pytorch.org/whl/cu128
-  pip install jupyterlab notebook ipywidgets ipykernel PyQt5 matplotlib
+  # CPU-only for aarch64 (Apple Silicon Docker), CUDA for x86_64
+  if [ "$(uname -m)" = "x86_64" ]; then
+    pip install torch --index-url https://download.pytorch.org/whl/cu128
+  else
+    pip install torch --index-url https://download.pytorch.org/whl/cpu
+  fi
+  pip install jupyterlab notebook ipywidgets ipykernel matplotlib
   pip install --verbose --no-build-isolation --editable .
 elif [ -f "/workspace/pyproject.toml" ]; then
   . /workspace/.venv-docker/bin/activate
@@ -20,7 +25,7 @@ elif [ -f "/workspace/pyproject.toml" ]; then
   # Ensure Jupyter is available in existing venvs
   if ! command -v jupyter >/dev/null 2>&1; then
     echo "[entrypoint] Installing Jupyter into existing venv ..."
-    pip install jupyterlab notebook ipywidgets ipykernel PyQt5 matplotlib
+    pip install jupyterlab notebook ipywidgets ipykernel matplotlib
   fi
   pip install --no-build-isolation -e . 2>/dev/null || true
 else
