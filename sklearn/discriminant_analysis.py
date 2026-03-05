@@ -984,19 +984,70 @@ class LinearDiscriminantAnalysis(
         else:
             _, S_new, Vt_new = xp.linalg.svd(Z, full_matrices=False)
 
-        # Truncate negligible components using relative rank filtering
-        # (scale-independent, unlike absolute self.tol).
-        # Singular values are sorted descending, so the keep mask is a prefix.
+        # Truncate to bound per-step SVD cost.  Two passes:
+        # 1. Numerical rank — discard machine-precision noise.
+        # 2. Whitened-energy truncation — discard trailing components whose
+        #    *cumulative* contribution to the whitened scatter is < tol of
+        #    the total.  "Whitened" means weighted by 1/std per feature, so
+        #    small-variance features are properly amplified (matching what
+        #    _reconstruct_svd_attrs does).  For full-rank data (no spectral
+        #    gap) this keeps everything; for low-rank data it bounds the
+        #    stored rank to the effective dimensionality, giving
+        #    O((eff_rank + chunk_size) * D^2) per step instead of
+        #    O((D + chunk_size) * D^2).
         if S_new.shape[0] > 0:
             eps = float(xp.finfo(Z.dtype).eps)
             threshold = eps * max(Z.shape) * float(S_new[0])
-            # Find rank: singular values are sorted, so find first below threshold
-            rank = 0
+            # Pass 1: numerical rank
+            num_rank = 0
             for i in range(S_new.shape[0]):
                 if float(S_new[i]) > threshold:
-                    rank = i + 1
+                    num_rank = i + 1
                 else:
                     break
+            # Pass 2: whitened-energy truncation within numerical rank.
+            # Compute per-feature within-class std (replicating the logic
+            # in _reconstruct_svd_attrs) and weight each component's energy
+            # by 1/std^2 so that small-variance features are not lost.
+            rank = num_rank
+            N_total = float(xp.sum(self._class_counts))
+            if num_rank > 1 and N_total > 0:
+                raw_std = xp.sqrt(
+                    xp.maximum(
+                        self._within_sum_sq,
+                        xp.asarray(0.0, dtype=xp.float64, device=dev),
+                    )
+                    / N_total
+                )
+                std_max = float(xp.max(raw_std)) if raw_std.shape[0] > 0 else 1.0
+                noise_floor = (
+                    math.sqrt(N_total)
+                    * float(xp.finfo(xp.float64).eps)
+                    * max(std_max, 1.0)
+                )
+                clamped_std = xp.where(
+                    raw_std <= noise_floor,
+                    xp.asarray(1.0, dtype=xp.float64, device=dev),
+                    raw_std,
+                )
+                inv_std = 1.0 / clamped_std
+                # whitened energy[i] = S[i]^2 * ||Vt[i,:] / std||^2
+                inv_std_sq = inv_std**2
+                energies = []
+                for i in range(num_rank):
+                    si = float(S_new[i])
+                    row = Vt_new[i]
+                    w_energy = si * si * float(xp.sum(row**2 * inv_std_sq))
+                    energies.append(w_energy)
+                total_energy = sum(energies)
+                if total_energy > 0:
+                    target = (1.0 - self.tol**2) * total_energy
+                    cum = 0.0
+                    for i in range(num_rank):
+                        cum += energies[i]
+                        if cum >= target:
+                            rank = i + 1
+                            break
         else:
             rank = 0
         self._unscaled_S = S_new[:rank]
