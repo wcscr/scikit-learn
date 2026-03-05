@@ -46,6 +46,44 @@ from sklearn.datasets import make_classification
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 
 # ---------------------------------------------------------------------------
+# ANSI colour helpers
+# ---------------------------------------------------------------------------
+
+_USE_COLOR = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+
+def _c(code, text):
+    """Wrap *text* in ANSI escape *code* if stdout is a TTY."""
+    if not _USE_COLOR:
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def _green(t):
+    return _c("32", t)
+
+
+def _red(t):
+    return _c("31", t)
+
+
+def _yellow(t):
+    return _c("33", t)
+
+
+def _cyan(t):
+    return _c("36", t)
+
+
+def _bold(t):
+    return _c("1", t)
+
+
+def _status_str(passed):
+    return _green("PASS") if passed else _red("FAIL")
+
+
+# ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
@@ -82,10 +120,11 @@ class ScenarioResult:
 # ---------------------------------------------------------------------------
 
 
-def _log(msg, indent=1):
+def _log(msg, indent=1, color=None):
     """Print a progress message with indentation and flush."""
     prefix = "  " * indent
-    print(f"{prefix}{msg}", flush=True)
+    text = msg if color is None else _c(color, msg)
+    print(f"{prefix}{text}", flush=True)
 
 
 @contextmanager
@@ -122,15 +161,16 @@ def print_table(results, file=sys.stdout):
         f" {'acc_bat':>8} {'acc_str':>8} {'agree':>8} {'delta':>8}"
         f" {'t_bat':>7} {'t_str':>7} {'pass':>5}"
     )
-    print(header, file=file)
+    print(_bold(header), file=file)
     print("-" * len(header), file=file)
     for r in results:
         if r.skipped:
             print(
-                f"{r.scenario:<16} {'SKIPPED':<6} {r.skip_reason}", file=file
+                f"{r.scenario:<16} {_yellow('SKIP'):<6}   {r.skip_reason}",
+                file=file,
             )
             continue
-        status = "PASS" if r.passed else "FAIL"
+        status = _status_str(r.passed)
         print(
             f"{r.scenario:<16} {r.solver:<6} {r.backend:<11} {r.chunk_size:>6}"
             f" {r.acc_batch:>8.4f} {r.acc_stream:>8.4f}"
@@ -694,8 +734,7 @@ def _run_standard_scenario(
                 r.has_nan_inf = True
                 r.passed = False
                 r.warnings.append("NaN/Inf in model attributes")
-            status = "PASS" if r.passed else "FAIL"
-            _log(f"Result: {status} | acc_stream={acc_stream:.4f}"
+            _log(f"Result: {_status_str(r.passed)} | acc_stream={acc_stream:.4f}"
                  + (f" agree={pred_agree:.4f}" if not np.isnan(pred_agree) else ""))
             results.append(r)
 
@@ -706,13 +745,24 @@ def _run_standard_scenario(
 
 # --- Scenario 1: wide ---
 def scenario_wide(args):
+    # D >> N: eigen needs within_df >= n_features (impossible here) and
+    # lsqr produces rank-deficient covariance → garbage solution.
+    # Only SVD handles the wide regime reliably.
+    svd_only = [s for s in args.solvers if s == "svd"]
+    if not svd_only:
+        r = ScenarioResult(
+            scenario="wide", solver="N/A", backend="numpy",
+            chunk_size=0, n_samples=0, n_features=0, n_classes=0,
+            skipped=True, skip_reason="svd solver not selected",
+        )
+        return [r]
     return _run_standard_scenario(
         scenario_name="wide",
         n_samples=10000,
         n_features=5000,
         n_classes=10,
-        chunk_sizes=[100, 500, 1000],
-        solvers=args.solvers,
+        chunk_sizes=[2500, 5000, 10000],
+        solvers=svd_only,
         tier="tight",
         thresholds=TIER_TIGHT,
         quick=args.quick,
@@ -727,7 +777,7 @@ def scenario_tall(args):
         n_samples=n,
         n_features=50,
         n_classes=10,
-        chunk_sizes=[1000, 5000, 10000],
+        chunk_sizes=[50000, 125000, 250000, 500000],
         solvers=args.solvers,
         tier="tight",
         thresholds=TIER_TIGHT,
@@ -743,7 +793,7 @@ def scenario_many_classes(args):
         n_samples=50000,
         n_features=100,
         n_classes=50,
-        chunk_sizes=[500, 2000],
+        chunk_sizes=[10000, 25000, 50000],
         solvers=args.solvers,
         tier="tight",
         thresholds=TIER_TIGHT,
@@ -785,7 +835,7 @@ def scenario_imbalanced(args):
         acc_batch = float(np.mean(pred_batch == y_full))
         _log(f"Batch fit ({solver}): acc={acc_batch:.4f}, time={t_batch:.2f}s")
 
-        chunk_list = [200, 1000, 5000] if not args.quick else [20, 100, 500]
+        chunk_list = [5000, 10000, 20000] if not args.quick else [200, 1000, 2000]
         for cs in chunk_list:
             _log(f"Streaming {solver} cs={cs}...")
             def _make_chunks():
@@ -830,8 +880,7 @@ def scenario_imbalanced(args):
                 r.has_nan_inf = True
                 r.passed = False
                 r.warnings.append("NaN/Inf in model attributes")
-            status = "PASS" if r.passed else "FAIL"
-            _log(f"Result: {status} | acc={acc_stream:.4f} agree={pred_agree:.4f}")
+            _log(f"Result: {_status_str(r.passed)} | acc={acc_stream:.4f} agree={pred_agree:.4f}")
             results.append(r)
         gc.collect()
     return results
@@ -869,7 +918,7 @@ def scenario_high_d(args):
         n_samples=1000,
         n_features=10000,
         n_classes=5,
-        chunk_sizes=[50, 200],
+        chunk_sizes=[250, 500, 1000],
         solvers=svd_only,
         tier="structural",
         thresholds={"acc_floor": 0.70},
@@ -884,7 +933,7 @@ def scenario_near_singular(args):
         n_samples=20000,
         n_features=50,
         n_classes=5,
-        chunk_sizes=[500, 2000],
+        chunk_sizes=[5000, 10000, 20000],
         solvers=args.solvers,
         tier="tight",
         thresholds=TIER_TIGHT,
@@ -902,7 +951,7 @@ def scenario_mnist(args):
         scenario_name="mnist",
         openml_name="mnist_784",
         openml_version=1,
-        chunk_sizes=[1000, 5000, 10000],
+        chunk_sizes=[10000, 35000, 70000],
     )
 
 
@@ -913,7 +962,7 @@ def scenario_fashion_mnist(args):
         scenario_name="fashion_mnist",
         openml_name="Fashion-MNIST",
         openml_version=1,
-        chunk_sizes=[1000, 5000],
+        chunk_sizes=[10000, 35000, 70000],
     )
 
 
@@ -941,13 +990,13 @@ def scenario_covertype(args):
         )
         return [r]
 
-    chunk_sizes = [5000, 10000, 50000]
+    chunk_sizes = [50000, 200000, 581012]
     if args.quick:
         # Subsample
         rng = np.random.RandomState(42)
         idx = rng.choice(len(X_all), size=min(20000, len(X_all)), replace=False)
         X_all, y_all = X_all[idx], y_all[idx]
-        chunk_sizes = [500, 1000, 5000]
+        chunk_sizes = [5000, 10000, 20000]
 
     return _run_with_data(
         args,
@@ -1011,78 +1060,134 @@ def _run_public_dataset(
 
 def _run_with_data(args, scenario_name, X_all, y_all, chunk_sizes,
                    thresholds, tier):
-    """Run batch + streaming comparison on pre-loaded data."""
-    from sklearn.model_selection import StratifiedShuffleSplit
+    """Run batch + streaming comparison on pre-loaded data.
 
-    splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=42)
-    train_idx, test_idx = next(splitter.split(X_all, y_all))
-    X_train, y_train = X_all[train_idx], y_all[train_idx]
-    X_test, y_test = X_all[test_idx], y_all[test_idx]
-    classes = np.unique(y_train)
-    n_features = X_train.shape[1]
+    Uses k-fold CV (``args.n_folds``) by default, or a single 80/20 holdout
+    split when ``args.no_cv`` is set.  Results are averaged across folds.
+    """
+    from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+
+    if args.no_cv:
+        splitter = StratifiedShuffleSplit(
+            n_splits=1, test_size=0.2, random_state=42
+        )
+        n_splits = 1
+        cv_label = "holdout"
+    else:
+        n_splits = args.n_folds
+        splitter = StratifiedKFold(
+            n_splits=n_splits, shuffle=True, random_state=42
+        )
+        cv_label = f"{n_splits}-fold"
+
+    classes = np.unique(y_all)
+    n_features = X_all.shape[1]
     n_classes = len(classes)
 
-    _log(f"Data: train={X_train.shape}, test={X_test.shape}, "
-         f"classes={n_classes}, chunks={chunk_sizes}")
+    _log(f"Data: {X_all.shape}, classes={n_classes}, "
+         f"eval={cv_label}, chunks={chunk_sizes}")
 
     results = []
     for solver in args.solvers:
         solver_shrinkage = None
-        _log(f"Batch fit ({solver})...")
-        clf_batch, t_batch, mem_batch = run_batch_fit(
-            X_train, y_train, solver, shrinkage=solver_shrinkage
-        )
-        pred_batch = clf_batch.predict(X_test)
-        acc_batch = float(np.mean(pred_batch == y_test))
-        _log(f"Batch fit ({solver}): acc={acc_batch:.4f}, time={t_batch:.2f}s")
 
         for cs in chunk_sizes:
-            _log(f"Streaming {solver} cs={cs}...")
-            def _make_chunks(sz=cs):
-                for start in range(0, len(X_train), sz):
-                    end = min(start + sz, len(X_train))
-                    yield X_train[start:end], y_train[start:end]
+            # Accumulate metrics across folds
+            fold_acc_batch = []
+            fold_acc_stream = []
+            fold_pred_agree = []
+            fold_t_batch = []
+            fold_t_stream = []
+            fold_mem_batch = []
+            fold_mem_stream = []
+            fold_coef_ok = []
+            fold_has_nan = []
 
-            clf_stream, t_stream, mem_stream, n_seen = run_streaming_fit(
-                _make_chunks(), classes, solver, shrinkage=solver_shrinkage,
-                n_total=len(X_train),
-            )
-            _log(f"Streaming {solver} cs={cs}: time={t_stream:.2f}s")
-            has_nan = check_model_sanity(clf_stream)
-            pred_stream = clf_stream.predict(X_test)
-            acc_stream = float(np.mean(pred_stream == y_test))
-            pred_agree = float(np.mean(pred_stream == pred_batch))
-            coef_ok = _check_coef_close(
-                clf_batch, clf_stream, thresholds.get("coef_atol", 1e-4)
-            )
+            for fold_i, (train_idx, test_idx) in enumerate(
+                splitter.split(X_all, y_all)
+            ):
+                X_train, y_train = X_all[train_idx], y_all[train_idx]
+                X_test, y_test = X_all[test_idx], y_all[test_idx]
+
+                fold_tag = f"fold {fold_i + 1}/{n_splits}" if n_splits > 1 else "holdout"
+
+                # --- batch ---
+                _log(f"Batch {solver} cs={cs} [{fold_tag}]...")
+                clf_batch, t_batch, mem_batch = run_batch_fit(
+                    X_train, y_train, solver, shrinkage=solver_shrinkage
+                )
+                pred_batch = clf_batch.predict(X_test)
+                acc_batch = float(np.mean(pred_batch == y_test))
+                _log(f"Batch {solver} [{fold_tag}]: acc={acc_batch:.4f}, "
+                     f"time={t_batch:.2f}s")
+
+                # --- streaming ---
+                _log(f"Stream {solver} cs={cs} [{fold_tag}]...")
+
+                def _make_chunks(X=X_train, y=y_train, sz=cs):
+                    for start in range(0, len(X), sz):
+                        end = min(start + sz, len(X))
+                        yield X[start:end], y[start:end]
+
+                clf_stream, t_stream, mem_stream, n_seen = run_streaming_fit(
+                    _make_chunks(), classes, solver,
+                    shrinkage=solver_shrinkage,
+                    n_total=len(X_train),
+                )
+                _log(f"Stream {solver} cs={cs} [{fold_tag}]: "
+                     f"time={t_stream:.2f}s")
+
+                has_nan = check_model_sanity(clf_stream)
+                pred_stream = clf_stream.predict(X_test)
+                acc_stream = float(np.mean(pred_stream == y_test))
+                pred_agree = float(np.mean(pred_stream == pred_batch))
+                coef_ok = _check_coef_close(
+                    clf_batch, clf_stream,
+                    thresholds.get("coef_atol", 1e-4),
+                )
+
+                fold_acc_batch.append(acc_batch)
+                fold_acc_stream.append(acc_stream)
+                fold_pred_agree.append(pred_agree)
+                fold_t_batch.append(t_batch)
+                fold_t_stream.append(t_stream)
+                fold_mem_batch.append(mem_batch)
+                fold_mem_stream.append(mem_stream)
+                fold_coef_ok.append(coef_ok)
+                fold_has_nan.append(has_nan)
+
+            # Aggregate across folds (means for floats, all() for bools)
+            mean_acc_batch = float(np.mean(fold_acc_batch))
+            mean_acc_stream = float(np.mean(fold_acc_stream))
+            mean_pred_agree = float(np.mean(fold_pred_agree))
+            mean_acc_delta = mean_acc_stream - mean_acc_batch
 
             r = ScenarioResult(
                 scenario=scenario_name,
                 solver=solver,
                 backend="numpy",
                 chunk_size=cs,
-                n_samples=len(X_train),
+                n_samples=len(X_all),
                 n_features=n_features,
                 n_classes=n_classes,
-                acc_batch=acc_batch,
-                acc_stream=acc_stream,
-                pred_agreement=pred_agree,
-                acc_delta=acc_stream - acc_batch,
-                coef_atol_ok=coef_ok,
-                wall_time_batch=t_batch,
-                wall_time_stream=t_stream,
-                peak_mem_batch_mb=mem_batch,
-                peak_mem_stream_mb=mem_stream,
-                has_nan_inf=has_nan,
+                acc_batch=mean_acc_batch,
+                acc_stream=mean_acc_stream,
+                pred_agreement=mean_pred_agree,
+                acc_delta=mean_acc_delta,
+                coef_atol_ok=all(fold_coef_ok),
+                wall_time_batch=float(np.sum(fold_t_batch)),
+                wall_time_stream=float(np.sum(fold_t_stream)),
+                peak_mem_batch_mb=float(np.max(fold_mem_batch)),
+                peak_mem_stream_mb=float(np.max(fold_mem_stream)),
+                has_nan_inf=any(fold_has_nan),
                 tier=tier,
             )
             validate_result(r, thresholds, has_batch=True)
-            if has_nan:
-                r.has_nan_inf = True
+            if r.has_nan_inf:
                 r.passed = False
                 r.warnings.append("NaN/Inf in model attributes")
-            status = "PASS" if r.passed else "FAIL"
-            _log(f"Result: {status} | acc={acc_stream:.4f} agree={pred_agree:.4f}")
+            _log(f"Result ({cv_label}): {_status_str(r.passed)}"
+                 f" | acc={mean_acc_stream:.4f} agree={mean_pred_agree:.4f}")
             results.append(r)
         gc.collect()
     return results
@@ -1139,7 +1244,7 @@ def _run_backend_scenarios(args, backend_name):
         n_samples=10000,
         n_features=5000,
         n_classes=10,
-        chunk_sizes=[100, 500, 1000],
+        chunk_sizes=[2500, 5000, 10000],
         solvers=["svd"],
         tier="tight",
         thresholds=TIER_TIGHT,
@@ -1156,7 +1261,7 @@ def _run_backend_scenarios(args, backend_name):
         n_samples=50000,
         n_features=100,
         n_classes=50,
-        chunk_sizes=[500, 2000],
+        chunk_sizes=[10000, 25000, 50000],
         solvers=["svd"],
         tier="tight",
         thresholds=TIER_TIGHT,
@@ -1174,7 +1279,7 @@ def _run_backend_scenarios(args, backend_name):
             scenario_name=f"mnist@{backend_name}",
             openml_name="mnist_784",
             openml_version=1,
-            chunk_sizes=[1000, 5000],
+            chunk_sizes=[10000, 35000, 70000],
             backend_name=backend_name,
             convert_fn=convert_fn,
         )
@@ -1402,6 +1507,14 @@ def main():
         "--quick", action="store_true",
         help="10x smaller sizes for quick smoke testing",
     )
+    parser.add_argument(
+        "--n-folds", type=int, default=5,
+        help="Number of stratified CV folds for public datasets (default: 5)",
+    )
+    parser.add_argument(
+        "--no-cv", action="store_true",
+        help="Use a single 80/20 holdout split instead of k-fold CV",
+    )
 
     args = parser.parse_args()
 
@@ -1414,13 +1527,22 @@ def main():
     print(f"Scenarios: {', '.join(scenario_names)}")
     print(f"Solvers:   {', '.join(args.solvers)}")
     print(f"Quick:     {args.quick}")
+    cv_desc = "single holdout" if args.no_cv else f"{args.n_folds}-fold CV"
+    print(f"CV:        {cv_desc}")
     print(f"CUDA:      {args.include_cuda}")
     print()
+
+    _SCENARIO_BACKEND = {
+        "torch_cpu": "torch/CPU",
+        "torch_cuda": "torch/GPU",
+        "cupy_cuda": "cupy/GPU",
+    }
 
     all_results = []
     for name in scenario_names:
         fn = SCENARIOS[name]
-        print(f"--- Running scenario: {name} ---")
+        backend_label = _SCENARIO_BACKEND.get(name, "numpy/CPU")
+        print(_bold(f"--- Running scenario: {name}  [backend: {backend_label}] ---"))
         try:
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
@@ -1437,15 +1559,24 @@ def main():
 
         all_results.extend(results)
 
-        # Print per-scenario summary
+        # Print per-scenario summary with backend info
+        backends_used = sorted(
+            {r.backend for r in results if not r.skipped and r.backend != "N/A"}
+        )
+        backend_str = ", ".join(backends_used) if backends_used else "N/A"
         n_pass = sum(r.passed for r in results if not r.skipped)
         n_fail = sum(not r.passed for r in results if not r.skipped)
         n_skip = sum(r.skipped for r in results)
-        print(f"  {n_pass} passed, {n_fail} failed, {n_skip} skipped")
+        print(f"  Backend: {_cyan(backend_str)}")
+        print(
+            f"  {_green(str(n_pass))} passed, "
+            f"{_red(str(n_fail)) if n_fail else str(n_fail)} failed, "
+            f"{n_skip} skipped"
+        )
         for r in results:
             if r.warnings:
                 for w in r.warnings:
-                    print(f"  WARN [{r.solver} cs={r.chunk_size}]: {w}")
+                    print(f"  {_yellow('WARN')} [{r.solver} cs={r.chunk_size}]: {w}")
         print()
 
     # Summary
@@ -1462,10 +1593,11 @@ def main():
     overall_pass = n_failed == 0
 
     print(
-        f"Total: {n_total} | Passed: {n_passed} | Failed: {n_failed}"
+        f"Total: {n_total} | Passed: {_green(str(n_passed))}"
+        f" | Failed: {_red(str(n_failed)) if n_failed else str(n_failed)}"
         f" | Skipped: {n_skipped}"
     )
-    print(f"Overall: {'PASS' if overall_pass else 'FAIL'}")
+    print(f"Overall: {_bold(_green('PASS') if overall_pass else _red('FAIL'))}")
 
     # Informational warnings
     for r in all_results:

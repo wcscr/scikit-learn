@@ -1,0 +1,75 @@
+#!/bin/sh
+set -e
+
+cd "$(dirname "$0")/.."
+
+# Ensure .claude dir exists on host so the bind-mount doesn't create it as
+# root-owned (which would make settings.json unwritable inside the container).
+mkdir -p "$(pwd)/.claude"
+
+# ---------------------------------------------------------------------------
+# WSL: fetch OAuth token from Windows Credential Manager and mount data drives
+# ---------------------------------------------------------------------------
+MNT_MOUNTS=""
+if [ -f /proc/version ] && grep -qi microsoft /proc/version 2>/dev/null; then
+    # Retrieve CLAUDE_CODE_OAUTH_TOKEN from Windows Credential Manager via
+    # PowerShell interop (CredRead P/Invoke).  Falls back to the environment
+    # variable if PowerShell is unavailable or the credential doesn't exist.
+    if command -v powershell.exe >/dev/null 2>&1; then
+        _wsl_token=$(powershell.exe -NoProfile -NonInteractive -Command '
+            Add-Type -Namespace CredMan -Name Native -MemberDefinition @"
+                [DllImport("advapi32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+                public static extern bool CredRead(string target, int type, int flags, out IntPtr cred);
+                [DllImport("advapi32.dll")]
+                public static extern bool CredFree(IntPtr buffer);
+                [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
+                public struct CREDENTIAL {
+                    public uint Flags; public uint Type; public string TargetName; public string Comment;
+                    public long LastWritten; public uint CredentialBlobSize; public IntPtr CredentialBlob;
+                    public uint Persist; public uint AttrCount; public IntPtr Attrs;
+                    public string TargetAlias; public string UserName;
+                }
+"@
+            $ptr = [IntPtr]::Zero
+            if ([CredMan.Native]::CredRead("CLAUDE_CODE_OAUTH_TOKEN",1,0,[ref]$ptr)) {
+                $c = [Runtime.InteropServices.Marshal]::PtrToStructure($ptr,[type][CredMan.Native+CREDENTIAL])
+                if ($c.CredentialBlobSize -gt 0) {
+                    [Runtime.InteropServices.Marshal]::PtrToStringUni($c.CredentialBlob,$c.CredentialBlobSize/2)
+                }
+                [void][CredMan.Native]::CredFree($ptr)
+            }
+        ' 2>/dev/null | tr -d '\r\n')
+
+        if [ -n "$_wsl_token" ]; then
+            CLAUDE_CODE_OAUTH_TOKEN="$_wsl_token"
+            export CLAUDE_CODE_OAUTH_TOKEN
+            echo "[start_claude] OAuth token loaded from Windows Credential Manager"
+        fi
+    fi
+
+    # Mount Windows data drives if present
+    MNT_MOUNTS="-v /mnt/e/data:/workspace/data/e \
+    -v /mnt/f/data:/workspace/data/f \
+    -v /mnt/y/data:/workspace/data/y \
+    -v /mnt/z/data:/workspace/data/z"
+fi
+
+# Expose all NVIDIA GPUs to the container (requires nvidia-container-toolkit).
+# Falls back gracefully to CPU-only if no GPU is present.
+if command -v nvidia-smi >/dev/null 2>&1; then
+    GPU_FLAGS="--gpus all"
+    echo "[start_claude] NVIDIA GPU detected — passing all GPUs to container"
+else
+    GPU_FLAGS=""
+    echo "[start_claude] No NVIDIA GPU detected — running CPU-only"
+fi
+
+# shellcheck disable=SC2086
+docker run --rm -it $GPU_FLAGS --shm-size=4.19gb \
+    -p 8888:8888 \
+    -v "$(pwd)":/workspace \
+    -v "$(pwd)/.claude":/home/agent/.claude \
+    -v "$(pwd)/.docker/entrypoint.sh":/usr/local/bin/entrypoint.sh:ro \
+    $MNT_MOUNTS \
+    -e CLAUDE_CODE_OAUTH_TOKEN="$CLAUDE_CODE_OAUTH_TOKEN" \
+    scikit-learn-dev-claude
