@@ -936,7 +936,8 @@ def test_lda_partial_fit_single_sample_chunks(solver):
     classes = np.unique(y_full)
     for i in range(len(X_full)):
         clf_online.partial_fit(
-            X_full[i : i + 1], y_full[i : i + 1],
+            X_full[i : i + 1],
+            y_full[i : i + 1],
             classes=classes if i == 0 else None,
         )
 
@@ -979,7 +980,6 @@ def test_lda_partial_fit_collinear_features():
     assert_allclose(clf_online.intercept_, clf_batch.intercept_, atol=1e-5)
 
 
-
 def test_lda_partial_fit_raises_auto_shrinkage():
     """shrinkage='auto' must raise NotImplementedError."""
     clf = LinearDiscriminantAnalysis(solver="lsqr", shrinkage="auto")
@@ -1007,8 +1007,12 @@ def test_lda_partial_fit_raises_missing_classes():
 def test_lda_partial_fit_binary(solver):
     """Binary classification must produce 1D coef_ / intercept_."""
     X_full, y_full = make_classification(
-        n_samples=200, n_features=4, n_informative=4, n_redundant=0,
-        n_classes=2, random_state=1,
+        n_samples=200,
+        n_features=4,
+        n_informative=4,
+        n_redundant=0,
+        n_classes=2,
+        random_state=1,
     )
 
     clf_batch = LinearDiscriminantAnalysis(solver=solver)
@@ -1103,9 +1107,7 @@ def test_lda_partial_fit_honors_priors(solver):
     classes = np.unique(y_full)
     explicit_priors = [0.3, 0.7]
 
-    clf_priors = LinearDiscriminantAnalysis(
-        solver=solver, priors=explicit_priors
-    )
+    clf_priors = LinearDiscriminantAnalysis(solver=solver, priors=explicit_priors)
     clf_priors.partial_fit(X_full, y_full, classes=classes)
 
     clf_no_priors = LinearDiscriminantAnalysis(solver=solver)
@@ -1608,6 +1610,158 @@ def test_lda_svd_partial_fit_within_std_matches_batch_to_roundoff(
         clf_online._within_sum_sq, N_total
     )
     assert_allclose(std_online, std_batch, rtol=1e-12, atol=1e-12)
+
+
+def _check_array_api_available():
+    """Skip test if torch or SCIPY_ARRAY_API env is missing."""
+    import os
+
+    try:
+        import torch  # noqa: F401
+    except ImportError:
+        return False
+    return os.environ.get("SCIPY_ARRAY_API") == "1"
+
+
+@pytest.mark.skipif(
+    not _check_array_api_available(),
+    reason="PyTorch not installed or SCIPY_ARRAY_API!=1",
+)
+def test_lda_svd_partial_fit_array_api_torch_cpu():
+    """SVD partial_fit with PyTorch CPU tensors matches NumPy baseline."""
+    import torch
+
+    from sklearn import config_context
+
+    X_full, y_full = make_classification(
+        n_samples=300,
+        n_features=5,
+        n_informative=5,
+        n_redundant=0,
+        n_classes=3,
+        random_state=42,
+    )
+
+    # NumPy baseline
+    clf_np = LinearDiscriminantAnalysis(solver="svd")
+    classes = np.unique(y_full)
+    for i in range(0, len(X_full), 50):
+        clf_np.partial_fit(
+            X_full[i : i + 50], y_full[i : i + 50],
+            classes=classes if i == 0 else None,
+        )
+    pred_np = clf_np.predict(X_full)
+    score_np = clf_np.score(X_full, y_full)
+
+    # PyTorch CPU
+    X_t = torch.from_numpy(X_full)
+    y_t = torch.from_numpy(y_full)
+    with config_context(array_api_dispatch=True):
+        clf_torch = LinearDiscriminantAnalysis(solver="svd")
+        for i in range(0, len(X_full), 50):
+            clf_torch.partial_fit(
+                X_t[i : i + 50], y_t[i : i + 50],
+                classes=classes if i == 0 else None,
+            )
+
+        # Verify state types are torch tensors
+        assert isinstance(clf_torch.means_, torch.Tensor)
+        assert isinstance(clf_torch._class_counts, torch.Tensor)
+        assert isinstance(clf_torch._unscaled_S, torch.Tensor)
+        assert isinstance(clf_torch._unscaled_Vt, torch.Tensor)
+        assert isinstance(clf_torch._within_sum_sq, torch.Tensor)
+
+        # Verify state is on CPU
+        assert str(clf_torch.means_.device) == "cpu"
+
+        # predict output type depends on classes_ which is always numpy
+        pred_torch = clf_torch.predict(X_t)
+        score_torch = clf_torch.score(X_t, y_t)
+
+    # Results should match NumPy baseline closely
+    assert_allclose(
+        clf_torch.means_.numpy(), clf_np.means_, atol=1e-10,
+    )
+    assert abs(score_torch - score_np) < 0.01
+
+
+@pytest.mark.skipif(
+    not _check_array_api_available(),
+    reason="PyTorch not installed or SCIPY_ARRAY_API!=1",
+)
+def test_lda_svd_partial_fit_array_api_torch_cuda():
+    """SVD partial_fit with CUDA tensors keeps all state on GPU."""
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA not available")
+
+    from sklearn import config_context
+
+    rng = np.random.RandomState(42)
+    X_np = rng.randn(200, 5).astype(np.float64)
+    y_np = np.array([0] * 100 + [1] * 100)
+
+    # NumPy baseline
+    clf_np = LinearDiscriminantAnalysis(solver="svd")
+    classes = np.unique(y_np)
+    for i in range(0, 200, 50):
+        clf_np.partial_fit(
+            X_np[i : i + 50], y_np[i : i + 50],
+            classes=classes if i == 0 else None,
+        )
+
+    X_cuda = torch.from_numpy(X_np).cuda()
+    y_cuda = torch.from_numpy(y_np).cuda()
+
+    with config_context(array_api_dispatch=True):
+        clf_cuda = LinearDiscriminantAnalysis(solver="svd")
+        for i in range(0, 200, 50):
+            clf_cuda.partial_fit(
+                X_cuda[i : i + 50], y_cuda[i : i + 50],
+                classes=classes if i == 0 else None,
+            )
+
+        # All accumulated state should be on CUDA
+        assert clf_cuda.means_.device.type == "cuda"
+        assert clf_cuda._class_counts.device.type == "cuda"
+        assert clf_cuda._unscaled_S.device.type == "cuda"
+        assert clf_cuda._unscaled_Vt.device.type == "cuda"
+        assert clf_cuda._within_sum_sq.device.type == "cuda"
+
+        # Reconstructed attrs should also be on CUDA
+        assert clf_cuda.coef_.device.type == "cuda"
+        assert clf_cuda.scalings_.device.type == "cuda"
+
+    # Results should match NumPy baseline
+    assert_allclose(
+        clf_cuda.means_.cpu().numpy(), clf_np.means_, atol=1e-10,
+    )
+
+
+@pytest.mark.skipif(
+    not _check_array_api_available(),
+    reason="PyTorch not installed or SCIPY_ARRAY_API!=1",
+)
+def test_lda_svd_partial_fit_array_api_covariance_path_converts():
+    """Eigen/LSQR solvers should still convert to NumPy even with torch input."""
+    import torch
+
+    from sklearn import config_context
+
+    rng = np.random.RandomState(42)
+    X_np = rng.randn(100, 5).astype(np.float64)
+    y_np = np.array([0] * 50 + [1] * 50)
+    X_t = torch.from_numpy(X_np)
+    y_t = torch.from_numpy(y_np)
+
+    with config_context(array_api_dispatch=True):
+        clf = LinearDiscriminantAnalysis(solver="eigen")
+        clf.partial_fit(X_t[:50], y_t[:50], classes=np.array([0, 1]))
+        clf.partial_fit(X_t[50:], y_t[50:])
+
+        # Internal state should be numpy (converted at entry)
+        assert isinstance(clf.means_, np.ndarray)
 
 
 def test_lda_svd_partial_fit_mnist_accuracy_parity():
