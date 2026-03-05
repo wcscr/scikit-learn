@@ -1,12 +1,16 @@
-"""Tests for merge_lda_models (distributed LDA merge)."""
+"""Tests for merge_lda_models and DistributedLDA estimator."""
 
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose, assert_array_equal
+from sklearn.base import clone
 from sklearn.datasets import make_classification
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
-from sklearn_ext.distributed_lda import merge_lda_models
+from sklearn_ext.distributed_lda import DistributedLDA, merge_lda_models
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +303,32 @@ def test_merge_predict_proba():
     )
 
 
+def test_merge_continued_partial_fit():
+    """partial_fit on merged model equals sequential partial_fit on all data."""
+    rng = np.random.RandomState(42)
+    X1, y1 = _make_data(n_samples=200, n_features=6, n_classes=3, random_state=42)
+    X2 = rng.randn(80, 6)
+    y2 = np.array([0] * 27 + [1] * 27 + [2] * 26)
+    classes = np.array([0, 1, 2])
+
+    # Path A: merge two workers, then continued partial_fit with X2
+    models = _partial_fit_on_chunks(X1, y1, 2, classes=classes)
+    merged = merge_lda_models(models)
+    merged.partial_fit(X2, y2)
+
+    # Path B: sequential partial_fit on X1 chunks then X2
+    seq = _sequential_partial_fit(X1, y1, 2, classes=classes)
+    seq.partial_fit(X2, y2)
+
+    assert_allclose(merged.means_, seq.means_, atol=1e-10)
+    assert_allclose(
+        np.asarray(merged._class_counts), np.asarray(seq._class_counts)
+    )
+    assert_allclose(merged.coef_, seq.coef_, atol=1e-8)
+    assert_allclose(merged.intercept_, seq.intercept_, atol=1e-8)
+    assert_array_equal(merged.predict(X1), seq.predict(X1))
+
+
 def test_merge_store_covariance():
     """store_covariance=True works after merge."""
     X, y = _make_data(n_samples=300, n_features=6, n_classes=3)
@@ -387,3 +417,214 @@ def test_merge_raises_incompatible_hyperparams():
 
     with pytest.raises(ValueError, match="tol"):
         merge_lda_models([m1, m2])
+
+
+# ===========================================================================
+# DistributedLDA estimator tests
+# ===========================================================================
+
+
+class TestDistributedLDAFitPredict:
+    """sklearn API compliance tests."""
+
+    def test_fit_predict(self):
+        """fit(X, y) then predict(X) matches batch LDA."""
+        X, y = _make_data(n_samples=300, n_features=6, n_classes=3)
+        dlda = DistributedLDA(n_partitions=4).fit(X, y)
+        batch = LinearDiscriminantAnalysis(solver="svd").fit(X, y)
+        assert_array_equal(dlda.predict(X), batch.predict(X))
+
+    def test_transform(self):
+        """transform(X) matches batch LDA."""
+        X, y = _make_data(n_samples=300, n_features=6, n_classes=3)
+        dlda = DistributedLDA(n_partitions=4).fit(X, y)
+        batch = LinearDiscriminantAnalysis(solver="svd").fit(X, y)
+        assert_allclose(dlda.transform(X), batch.transform(X), atol=1e-6)
+
+    def test_predict_proba(self):
+        """predict_proba(X) matches batch LDA."""
+        X, y = _make_data(n_samples=300, n_features=6, n_classes=3)
+        dlda = DistributedLDA(n_partitions=4).fit(X, y)
+        batch = LinearDiscriminantAnalysis(solver="svd").fit(X, y)
+        assert_allclose(
+            dlda.predict_proba(X), batch.predict_proba(X), atol=1e-6
+        )
+
+    def test_get_set_params(self):
+        """get_params() returns all constructor args; set_params() updates."""
+        dlda = DistributedLDA(n_partitions=3, tol=1e-3)
+        params = dlda.get_params()
+        assert params["n_partitions"] == 3
+        assert params["tol"] == 1e-3
+        assert params["solver"] == "svd"
+        assert params["n_jobs"] is None
+
+        dlda.set_params(n_partitions=8, n_components=2)
+        assert dlda.n_partitions == 8
+        assert dlda.n_components == 2
+
+    def test_clone(self):
+        """sklearn.base.clone() works correctly."""
+        dlda = DistributedLDA(n_partitions=3, tol=1e-3, n_components=2)
+        cloned = clone(dlda)
+        assert cloned.n_partitions == 3
+        assert cloned.tol == 1e-3
+        assert cloned.n_components == 2
+        assert not hasattr(cloned, "merged_estimator_")
+
+    def test_pipeline(self):
+        """Works as a step in Pipeline."""
+        X, y = _make_data(n_samples=300, n_features=6, n_classes=3)
+        pipe = Pipeline([
+            ("scaler", StandardScaler()),
+            ("lda", DistributedLDA(n_partitions=2)),
+        ])
+        pipe.fit(X, y)
+        preds = pipe.predict(X)
+        assert preds.shape == (300,)
+        assert set(preds).issubset(set(np.unique(y)))
+
+    def test_gridsearch(self):
+        """GridSearchCV can tune n_partitions and n_components."""
+        X, y = _make_data(n_samples=200, n_features=6, n_classes=3)
+        gs = GridSearchCV(
+            DistributedLDA(),
+            param_grid={"n_partitions": [2, 4], "n_components": [1, 2]},
+            cv=3,
+            scoring="accuracy",
+        )
+        gs.fit(X, y)
+        assert hasattr(gs, "best_params_")
+        assert gs.best_params_["n_partitions"] in [2, 4]
+
+
+class TestDistributedLDAFromEstimators:
+    """Tests for the from_estimators classmethod."""
+
+    def test_from_estimators(self):
+        """Predictions match merge_lda_models directly."""
+        X, y = _make_data(n_samples=300, n_features=6, n_classes=3)
+        classes = np.unique(y)
+        models = _partial_fit_on_chunks(X, y, 3, classes=classes)
+
+        merged_direct = merge_lda_models(models)
+        dlda = DistributedLDA.from_estimators(models)
+
+        assert_array_equal(dlda.predict(X), merged_direct.predict(X))
+        assert_allclose(
+            dlda.predict_proba(X), merged_direct.predict_proba(X), atol=1e-10
+        )
+
+    def test_from_estimators_continued_partial_fit(self):
+        """Can partial_fit after from_estimators."""
+        X, y = _make_data(n_samples=300, n_features=6, n_classes=3)
+        classes = np.unique(y)
+        models = _partial_fit_on_chunks(X, y, 3, classes=classes)
+
+        dlda = DistributedLDA.from_estimators(models)
+
+        rng = np.random.RandomState(99)
+        X_new = rng.randn(60, 6)
+        y_new = np.array([0] * 20 + [1] * 20 + [2] * 20)
+        dlda.partial_fit(X_new, y_new)
+
+        # Should still predict without error
+        preds = dlda.predict(X)
+        assert preds.shape == (300,)
+
+
+class TestDistributedLDAEdgeCases:
+    """Edge case and validation tests."""
+
+    def test_n_jobs(self):
+        """n_jobs=-1 produces same results as default."""
+        X, y = _make_data(n_samples=300, n_features=6, n_classes=3)
+        dlda_seq = DistributedLDA(n_partitions=4, n_jobs=1).fit(X, y)
+        dlda_par = DistributedLDA(n_partitions=4, n_jobs=-1).fit(X, y)
+        assert_array_equal(dlda_seq.predict(X), dlda_par.predict(X))
+
+    def test_raises_non_svd(self):
+        """solver='lsqr' raises ValueError."""
+        X, y = _make_data(n_samples=100, n_features=4, n_classes=2)
+        dlda = DistributedLDA(solver="lsqr")
+        with pytest.raises(ValueError, match="solver='svd'"):
+            dlda.fit(X, y)
+
+    def test_raises_n_partitions_less_than_2(self):
+        """n_partitions=1 raises ValueError."""
+        X, y = _make_data(n_samples=100, n_features=4, n_classes=2)
+        dlda = DistributedLDA(n_partitions=1)
+        with pytest.raises(ValueError, match="n_partitions"):
+            dlda.fit(X, y)
+
+    def test_fitted_attrs_proxied(self):
+        """Fitted attributes are accessible on the wrapper."""
+        X, y = _make_data(n_samples=300, n_features=6, n_classes=3)
+        dlda = DistributedLDA(n_partitions=2).fit(X, y)
+        assert hasattr(dlda, "classes_")
+        assert hasattr(dlda, "means_")
+        assert hasattr(dlda, "coef_")
+        assert hasattr(dlda, "intercept_")
+        assert hasattr(dlda, "priors_")
+        assert dlda.n_features_in_ == 6
+
+    def test_unfitted_raises(self):
+        """Accessing fitted attrs before fit raises."""
+        dlda = DistributedLDA()
+        with pytest.raises(AttributeError):
+            _ = dlda.classes_
+
+
+# ===========================================================================
+# MNIST integration test
+# ===========================================================================
+
+
+def test_mnist_merge_vs_batch():
+    """Merge 10 independently partial_fit'd workers on MNIST digits and
+    compare prediction accuracy against a single batch fit on the same
+    train/test split.
+    """
+    from sklearn.datasets import fetch_openml
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import accuracy_score
+
+    # -- load MNIST 784-dim, 70k samples ---------------------------------
+    mnist = fetch_openml("mnist_784", version=1, as_frame=False, parser="auto")
+    X, y = mnist.data, mnist.target.astype(int)
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y,
+    )
+
+    classes = np.unique(y)
+
+    # -- batch fit --------------------------------------------------------
+    batch = LinearDiscriminantAnalysis(solver="svd")
+    batch.fit(X_train, y_train)
+    batch_acc = accuracy_score(y_test, batch.predict(X_test))
+
+    # -- distributed: 10 independent partial_fit workers, then merge ------
+    n_chunks = 10
+    chunks_X = np.array_split(X_train, n_chunks)
+    chunks_y = np.array_split(y_train, n_chunks)
+
+    workers = []
+    for cx, cy in zip(chunks_X, chunks_y):
+        m = LinearDiscriminantAnalysis(solver="svd")
+        m.partial_fit(cx, cy, classes=classes)
+        workers.append(m)
+
+    merged = merge_lda_models(workers)
+    merged_acc = accuracy_score(y_test, merged.predict(X_test))
+
+    # -- assertions -------------------------------------------------------
+    # Both should achieve strong accuracy on MNIST (>85%)
+    assert batch_acc > 0.85, f"Batch accuracy too low: {batch_acc:.4f}"
+    assert merged_acc > 0.85, f"Merged accuracy too low: {merged_acc:.4f}"
+
+    # Merged should be very close to batch (within 1 percentage point)
+    assert abs(batch_acc - merged_acc) < 0.01, (
+        f"Accuracy gap too large: batch={batch_acc:.4f}, "
+        f"merged={merged_acc:.4f}, diff={abs(batch_acc - merged_acc):.4f}"
+    )

@@ -5,6 +5,10 @@ This module provides :func:`merge_lda_models`, which combines N
 with ``solver='svd'`` — into a single model whose sufficient statistics
 equal the result of sequential ``partial_fit`` on all data combined.
 
+It also provides :class:`DistributedLDA`, a scikit-learn compatible estimator
+that partitions data across N workers, fits each via ``partial_fit``, and
+merges them — making the distributed approach pipeline- and GridSearchCV-ready.
+
 The merge exploits the associativity and commutativity of Chan's parallel
 variance algorithm, performing a single SVD on the concatenation of all
 compact factors and mean-shift corrections.
@@ -16,8 +20,10 @@ import warnings
 import numpy as np
 import scipy.linalg
 
+from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.utils._array_api import _is_numpy_namespace, get_namespace, device
+from sklearn.utils.validation import check_is_fitted, validate_data
 
 
 def merge_lda_models(estimators):
@@ -299,3 +305,205 @@ def merge_lda_models(estimators):
     merged._invalidate_svd_attrs()
 
     return merged
+
+
+# ======================================================================
+# DistributedLDA estimator
+# ======================================================================
+
+# Fitted attributes proxied from the merged LDA model.
+_PROXIED_ATTRS = frozenset({
+    "classes_", "means_", "priors_", "coef_", "intercept_",
+    "scalings_", "xbar_", "explained_variance_ratio_",
+    "covariance_", "n_features_in_",
+})
+
+
+class DistributedLDA(ClassifierMixin, TransformerMixin, BaseEstimator):
+    """LDA estimator that partitions data across N workers and merges.
+
+    This estimator is fully compatible with scikit-learn pipelines,
+    ``GridSearchCV``, and ``clone()``.  Internally it splits data into
+    ``n_partitions`` chunks, fits each via ``partial_fit`` (SVD solver),
+    and merges the results using :func:`merge_lda_models`.
+
+    Parameters
+    ----------
+    n_partitions : int, default=4
+        Number of independent workers to split data across during ``fit``.
+    solver : str, default='svd'
+        Must be ``'svd'``.  Kept for API consistency with
+        ``LinearDiscriminantAnalysis``.
+    shrinkage : str or float, optional
+        Forwarded to each worker LDA.
+    priors : array-like, optional
+        Forwarded to each worker LDA.
+    n_components : int, optional
+        Forwarded to each worker LDA.
+    store_covariance : bool, default=False
+        Forwarded to each worker LDA.
+    tol : float, default=1e-4
+        Forwarded to each worker LDA.
+    n_jobs : int, optional
+        Number of parallel jobs for fitting workers (``joblib``).
+    """
+
+    def __init__(self, n_partitions=4, solver='svd', shrinkage=None,
+                 priors=None, n_components=None, store_covariance=False,
+                 tol=1e-4, n_jobs=None):
+        self.n_partitions = n_partitions
+        self.solver = solver
+        self.shrinkage = shrinkage
+        self.priors = priors
+        self.n_components = n_components
+        self.store_covariance = store_covariance
+        self.tol = tol
+        self.n_jobs = n_jobs
+
+    # ------------------------------------------------------------------
+    # Attribute proxying
+    # ------------------------------------------------------------------
+
+    def __getattr__(self, name):
+        if name in _PROXIED_ATTRS:
+            try:
+                merged = object.__getattribute__(self, "merged_estimator_")
+            except AttributeError:
+                raise AttributeError(
+                    f"'{type(self).__name__}' object has no attribute '{name}'"
+                )
+            return getattr(merged, name)
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
+    # ------------------------------------------------------------------
+    # Core API
+    # ------------------------------------------------------------------
+
+    def fit(self, X, y):
+        """Partition data, fit N workers via partial_fit, and merge.
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+        y : array-like of shape (n_samples,)
+
+        Returns
+        -------
+        self
+        """
+        if self.solver != 'svd':
+            raise ValueError(
+                f"DistributedLDA only supports solver='svd', "
+                f"got solver='{self.solver}'."
+            )
+        if self.n_partitions < 2:
+            raise ValueError(
+                f"n_partitions must be >= 2, got {self.n_partitions}."
+            )
+
+        X, y = validate_data(self, X, y)
+        classes = np.unique(y)
+
+        n_partitions = min(self.n_partitions, len(y))
+
+        # Stratified split: try to keep class balance across partitions
+        indices = np.arange(len(y))
+        partition_indices = [[] for _ in range(n_partitions)]
+        for c in classes:
+            c_idx = indices[y == c]
+            splits = np.array_split(c_idx, n_partitions)
+            for i, s in enumerate(splits):
+                partition_indices[i].extend(s)
+
+        lda_kwargs = dict(
+            shrinkage=self.shrinkage,
+            priors=self.priors,
+            n_components=self.n_components,
+            store_covariance=self.store_covariance,
+            tol=self.tol,
+        )
+
+        def _fit_worker(idx):
+            m = LinearDiscriminantAnalysis(solver='svd', **lda_kwargs)
+            m.partial_fit(X[idx], y[idx], classes=classes)
+            return m
+
+        from joblib import Parallel, delayed
+        workers = Parallel(n_jobs=self.n_jobs)(
+            delayed(_fit_worker)(np.array(pi)) for pi in partition_indices
+        )
+
+        self.merged_estimator_ = merge_lda_models(workers)
+        return self
+
+    def predict(self, X):
+        """Predict class labels."""
+        check_is_fitted(self, "merged_estimator_")
+        return self.merged_estimator_.predict(X)
+
+    def transform(self, X):
+        """Project data to LDA space."""
+        check_is_fitted(self, "merged_estimator_")
+        return self.merged_estimator_.transform(X)
+
+    def predict_proba(self, X):
+        """Posterior probabilities of classification."""
+        check_is_fitted(self, "merged_estimator_")
+        return self.merged_estimator_.predict_proba(X)
+
+    def predict_log_proba(self, X):
+        """Log of posterior probabilities of classification."""
+        check_is_fitted(self, "merged_estimator_")
+        return self.merged_estimator_.predict_log_proba(X)
+
+    def decision_function(self, X):
+        """Decision function (log-posterior)."""
+        check_is_fitted(self, "merged_estimator_")
+        return self.merged_estimator_.decision_function(X)
+
+    def partial_fit(self, X, y, classes=None):
+        """Continue learning on new data after fit or from_estimators.
+
+        If already fitted, delegates to the merged model's partial_fit.
+        Otherwise creates a fresh internal LDA and starts streaming.
+        """
+        if hasattr(self, "merged_estimator_"):
+            self.merged_estimator_.partial_fit(X, y, classes=classes)
+        else:
+            lda_kwargs = dict(
+                shrinkage=self.shrinkage,
+                priors=self.priors,
+                n_components=self.n_components,
+                store_covariance=self.store_covariance,
+                tol=self.tol,
+            )
+            self.merged_estimator_ = LinearDiscriminantAnalysis(
+                solver='svd', **lda_kwargs
+            )
+            self.merged_estimator_.partial_fit(X, y, classes=classes)
+        return self
+
+    # ------------------------------------------------------------------
+    # Alternative constructor
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_estimators(cls, estimators, **kwargs):
+        """Create a DistributedLDA from pre-fitted LDA models.
+
+        Parameters
+        ----------
+        estimators : list of LinearDiscriminantAnalysis
+            Pre-fitted models (via ``partial_fit`` with ``solver='svd'``).
+        **kwargs
+            Forwarded to the ``DistributedLDA`` constructor.
+
+        Returns
+        -------
+        instance : DistributedLDA
+        """
+        instance = cls(**kwargs)
+        instance.merged_estimator_ = merge_lda_models(estimators)
+        return instance
