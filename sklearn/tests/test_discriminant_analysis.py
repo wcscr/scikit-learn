@@ -1739,6 +1739,56 @@ def test_lda_svd_partial_fit_array_api_torch_cuda():
     )
 
 
+def test_lda_svd_partial_fit_array_api_cupy_cuda():
+    """SVD partial_fit with CuPy arrays keeps all state on GPU."""
+    cupy = pytest.importorskip("cupy")
+
+    if not _check_array_api_available():
+        pytest.skip("SCIPY_ARRAY_API!=1")
+
+    from sklearn import config_context
+
+    rng = np.random.RandomState(42)
+    X_np = rng.randn(200, 5).astype(np.float64)
+    y_np = np.array([0] * 100 + [1] * 100)
+
+    # NumPy baseline
+    clf_np = LinearDiscriminantAnalysis(solver="svd")
+    classes = np.unique(y_np)
+    for i in range(0, 200, 50):
+        clf_np.partial_fit(
+            X_np[i : i + 50], y_np[i : i + 50],
+            classes=classes if i == 0 else None,
+        )
+
+    X_cu = cupy.asarray(X_np)
+    y_cu = cupy.asarray(y_np)
+
+    with config_context(array_api_dispatch=True):
+        clf_cu = LinearDiscriminantAnalysis(solver="svd")
+        for i in range(0, 200, 50):
+            clf_cu.partial_fit(
+                X_cu[i : i + 50], y_cu[i : i + 50],
+                classes=classes if i == 0 else None,
+            )
+
+        # All accumulated state should be CuPy arrays
+        assert isinstance(clf_cu.means_, cupy.ndarray)
+        assert isinstance(clf_cu._class_counts, cupy.ndarray)
+        assert isinstance(clf_cu._unscaled_S, cupy.ndarray)
+        assert isinstance(clf_cu._unscaled_Vt, cupy.ndarray)
+        assert isinstance(clf_cu._within_sum_sq, cupy.ndarray)
+
+        # Reconstructed attrs should also be CuPy
+        assert isinstance(clf_cu.coef_, cupy.ndarray)
+        assert isinstance(clf_cu.scalings_, cupy.ndarray)
+
+    # Results should match NumPy baseline
+    assert_allclose(
+        cupy.asnumpy(clf_cu.means_), clf_np.means_, atol=1e-10,
+    )
+
+
 @pytest.mark.skipif(
     not _check_array_api_available(),
     reason="PyTorch not installed or SCIPY_ARRAY_API!=1",

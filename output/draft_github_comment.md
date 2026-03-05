@@ -91,11 +91,24 @@ The implementation is left as-is (dispatching to `xp.linalg.svd`) rather than fo
 - `test_lda_svd_partial_fit_array_api_torch_cpu` — PyTorch CPU Array API roundtrip
 - `test_lda_svd_partial_fit_array_api_torch_cuda` — PyTorch CUDA Array API roundtrip
 - `test_lda_svd_partial_fit_array_api_covariance_path_converts` — covariance solver falls back to numpy when Array API is active
+- `test_lda_svd_partial_fit_array_api_cupy_cuda` — CuPy CUDA Array API roundtrip
 - `test_lda_svd_partial_fit_mnist_accuracy_parity` — MNIST accuracy parity (network test)
 
 ## Local verification
 
-All 109 tests pass (4 skipped: 3 require PyTorch + `SCIPY_ARRAY_API=1`, 1 requires network). The 3 PyTorch tests pass when run with the required env vars. Style checks pass.
+All 114 tests pass, 0 skipped. Tested on x86_64 Linux with NVIDIA GPU (CUDA 12.8), PyTorch 2.10, and CuPy 14.0.
+
+```bash
+SCIPY_ARRAY_API=1 SKLEARN_SKIP_NETWORK_TESTS=0 \
+  pytest sklearn/tests/test_discriminant_analysis.py -v
+# 114 passed in 15.65s
+```
+
+**Note:** 5 tests require specific hardware/env to avoid being skipped:
+- 2 PyTorch Array API tests (`torch_cpu`, `covariance_path_converts`): require `SCIPY_ARRAY_API=1` and PyTorch installed
+- 1 PyTorch CUDA test (`torch_cuda`): requires `SCIPY_ARRAY_API=1`, PyTorch, and NVIDIA GPU
+- 1 CuPy Array API test (`cupy_cuda`): requires `SCIPY_ARRAY_API=1` and CuPy + NVIDIA GPU
+- 1 MNIST test (`mnist_accuracy_parity`): requires `SKLEARN_SKIP_NETWORK_TESTS=0` and network access (or cached dataset)
 
 ---
 
@@ -123,7 +136,7 @@ Closes #30042.
   - Added `_partial_fit_covariance()` — incremental stats for eigen/lsqr (unchanged from previous).
   - Added `_reconstruct_svd_attrs()` with lazy `__getattr__` dispatch for deferred attribute computation.
   - Added `_invalidate_svd_attrs()` / `_clear_prediction_attrs()` for streaming state management.
-- `sklearn/tests/test_discriminant_analysis.py`: 30 new tests covering all solvers.
+- `sklearn/tests/test_discriminant_analysis.py`: 31 new tests covering all solvers.
 - `doc/whats_new/upcoming_changes/sklearn.discriminant_analysis/99999.feature.rst`: changelog entry.
 
 ### Behavioral notes
