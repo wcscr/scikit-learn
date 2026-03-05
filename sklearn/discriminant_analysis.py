@@ -3,6 +3,7 @@
 # Authors: The scikit-learn developers
 # SPDX-License-Identifier: BSD-3-Clause
 
+import math
 import warnings
 from numbers import Integral, Real
 
@@ -20,10 +21,22 @@ from sklearn.base import (
 from sklearn.covariance import empirical_covariance, ledoit_wolf, shrunk_covariance
 from sklearn.linear_model._base import LinearClassifierMixin
 from sklearn.preprocessing import StandardScaler
-from sklearn.utils._array_api import _expit, device, get_namespace, size
+from sklearn.utils._array_api import (
+    _convert_to_numpy,
+    _expit,
+    _is_numpy_namespace,
+    _max_precision_float_dtype,
+    device,
+    get_namespace,
+    size,
+)
 from sklearn.utils._param_validation import HasMethods, Interval, StrOptions
 from sklearn.utils.extmath import softmax
-from sklearn.utils.multiclass import check_classification_targets, unique_labels
+from sklearn.utils.multiclass import (
+    _check_partial_fit_first_call,
+    check_classification_targets,
+    unique_labels,
+)
 from sklearn.utils.validation import check_is_fitted, validate_data
 
 __all__ = ["LinearDiscriminantAnalysis", "QuadraticDiscriminantAnalysis"]
@@ -487,7 +500,17 @@ class LinearDiscriminantAnalysis(
         self.covariance_ = _class_cov(
             X, y, self.priors_, shrinkage, covariance_estimator
         )
-        self.coef_ = linalg.lstsq(self.covariance_, self.means_.T)[0].T
+        self._solve_lsqr_from_covariance(self.covariance_)
+
+    def _solve_lsqr_from_covariance(self, covariance):
+        """Compute coef_ and intercept_ from a precomputed covariance matrix.
+
+        Parameters
+        ----------
+        covariance : ndarray of shape (n_features, n_features)
+            The within-class covariance matrix.
+        """
+        self.coef_ = linalg.lstsq(covariance, self.means_.T)[0].T
         self.intercept_ = -0.5 * np.diag(np.dot(self.means_, self.coef_.T)) + np.log(
             self.priors_
         )
@@ -546,6 +569,19 @@ class LinearDiscriminantAnalysis(
         St = _cov(X, shrinkage, covariance_estimator)  # total scatter
         Sb = St - Sw  # between scatter
 
+        self._solve_eigen_from_matrices(Sb, Sw)
+
+    def _solve_eigen_from_matrices(self, Sb, Sw):
+        """Solve the generalized eigenvalue problem given scatter matrices.
+
+        Parameters
+        ----------
+        Sb : ndarray of shape (n_features, n_features)
+            Between-class scatter matrix.
+
+        Sw : ndarray of shape (n_features, n_features)
+            Within-class scatter matrix.
+        """
         evals, evecs = linalg.eigh(Sb, Sw)
         self.explained_variance_ratio_ = np.sort(evals / np.sum(evals))[::-1][
             : self._max_components
@@ -557,6 +593,23 @@ class LinearDiscriminantAnalysis(
         self.intercept_ = -0.5 * np.diag(np.dot(self.means_, self.coef_.T)) + np.log(
             self.priors_
         )
+
+    @staticmethod
+    def _clamp_svd_std(std):
+        """Clamp machine-noise std values to 1.0 for numerical stability."""
+        xp, _ = get_namespace(std)
+        std_max = float(xp.max(std))
+        noise_floor = xp.finfo(std.dtype).eps * max(std_max, 1.0)
+        one = xp.asarray(1.0, dtype=std.dtype, device=device(std))
+        std = xp.where(std <= noise_floor, one, std)
+        return std
+
+    @staticmethod
+    def _svd_std_from_within_sum_sq(within_sum_sq, n_total):
+        """Compute stable within-class std from a sum-of-squares vector."""
+        xp, _ = get_namespace(within_sum_sq)
+        zero = xp.asarray(0.0, dtype=within_sum_sq.dtype, device=device(within_sum_sq))
+        return xp.sqrt(xp.maximum(within_sum_sq, zero) / n_total)
 
     def _solve_svd(self, X, y):
         """SVD solver.
@@ -595,7 +648,7 @@ class LinearDiscriminantAnalysis(
         # 1) within (univariate) scaling by with classes std-dev
         std = xp.std(Xc, axis=0)
         # avoid division by zero in normalization
-        std[std == 0] = 1.0
+        std = self._clamp_svd_std(std)
         fac = xp.asarray(1.0 / (n_samples - n_classes), dtype=X.dtype, device=device(X))
 
         # 2) Within variance scaling
@@ -631,6 +684,362 @@ class LinearDiscriminantAnalysis(
         self.intercept_ = -0.5 * xp.sum(coef**2, axis=1) + xp.log(self.priors_)
         self.coef_ = coef @ self.scalings_.T
         self.intercept_ -= self.xbar_ @ self.coef_.T
+
+    # Attributes lazily reconstructed from the compact SVD factorization.
+    # Accessing any of these triggers _reconstruct_svd_attrs() when stale.
+    _SVD_LAZY_ATTRS = frozenset(
+        {
+            "coef_",
+            "intercept_",
+            "scalings_",
+            "xbar_",
+            "explained_variance_ratio_",
+            "covariance_",
+        }
+    )
+
+    def __getattr__(self, name):
+        if name in LinearDiscriminantAnalysis._SVD_LAZY_ATTRS:
+            if self.__dict__.get("_svd_attrs_stale", False):
+                self._ensure_svd_attrs()
+                if name in self.__dict__:
+                    return self.__dict__[name]
+        raise AttributeError(
+            f"'{type(self).__name__}' object has no attribute '{name}'"
+        )
+
+    def _invalidate_svd_attrs(self):
+        """Delete cached prediction attributes and mark them as stale."""
+        for attr in self._SVD_LAZY_ATTRS:
+            self.__dict__.pop(attr, None)
+        self._svd_attrs_stale = True
+
+    def _clear_prediction_attrs(self):
+        """Remove prediction attributes so the estimator becomes unfitted.
+
+        Called during reinit to prevent stale fitted attributes from
+        surviving a reset of the streaming accumulators.
+        """
+        for attr in (
+            "coef_",
+            "intercept_",
+            "scalings_",
+            "xbar_",
+            "explained_variance_ratio_",
+            "covariance_",
+            "_n_features_out",
+        ):
+            self.__dict__.pop(attr, None)
+        self._svd_attrs_stale = False
+
+    def _ensure_svd_attrs(self):
+        """Reconstruct prediction attributes from compact SVD if stale."""
+        if getattr(self, "_svd_attrs_stale", False):
+            self._reconstruct_svd_attrs()
+
+    def _reconstruct_svd_attrs(self):
+        """Derive public prediction attributes from compact SVD factors.
+
+        Computes scalings_, coef_, intercept_, xbar_, and
+        explained_variance_ratio_ from the stored (S, Vt) factorization.
+        This is separated from _partial_fit_svd so that it can be deferred
+        until prediction time, avoiding redundant work during streaming.
+
+        Array API compatible: operations stay on-device when the
+        accumulators live on a non-NumPy backend.
+
+        Assumes priors_ and _max_components are already set by
+        _partial_fit_svd.
+        """
+        xp = getattr(self, "_array_ns", np)
+        dev = getattr(self, "_array_device", None)
+        is_np = _is_numpy_namespace(xp)
+
+        n_classes = len(self.classes_)
+        n_classes_seen = int(
+            xp.sum(xp.astype(self._class_counts > 0, xp.int32))
+        )
+        N_total = float(xp.sum(self._class_counts))
+
+        # --- Reconstruct public attributes from compact SVD ---
+        # Inline std computation using stored xp (not get_namespace) so this
+        # works even when called lazily outside config_context.
+        zero = xp.asarray(0.0, dtype=xp.float64, device=dev)
+        std = xp.sqrt(xp.maximum(self._within_sum_sq, zero) / N_total)
+        # Streaming accumulation of sum-of-squares produces floating-point
+        # noise that scales with sqrt(N_total). Use a wider noise floor than
+        # the batch path to reliably clamp constant-column noise to 1.0.
+        std_max = float(xp.max(std)) if std.shape[0] > 0 else 1.0
+        noise_floor = (
+            math.sqrt(N_total) * float(xp.finfo(xp.float64).eps) * max(std_max, 1.0)
+        )
+        one = xp.asarray(1.0, dtype=std.dtype, device=dev)
+        std = xp.where(std <= noise_floor, one, std)
+
+        # Within-class scaling (equivalent to batch _solve_svd)
+        fac = 1.0 / (N_total - n_classes_seen)
+        SVt = xp.expand_dims(self._unscaled_S, axis=1) * self._unscaled_Vt
+        scaled = math.sqrt(fac) * (SVt / std)
+        if is_np:
+            _, S_scaled, Vt_scaled = scipy.linalg.svd(
+                scaled, full_matrices=False, check_finite=False
+            )
+        else:
+            _, S_scaled, Vt_scaled = xp.linalg.svd(scaled, full_matrices=False)
+
+        rank = int(xp.sum(xp.astype(S_scaled > self.tol, xp.int32)))
+        if rank == 0:
+            rank = 1  # ensure at least one component
+        scalings = (Vt_scaled[:rank, :] / std).T / S_scaled[:rank]
+
+        # Between-class scaling
+        self.xbar_ = self.priors_ @ self.means_
+        fac_between = 1.0 if n_classes == 1 else 1.0 / (n_classes - 1)
+        X_between = (
+            (xp.sqrt((N_total * self.priors_) * fac_between))
+            * (self.means_ - self.xbar_).T
+        ).T @ scalings
+
+        if is_np:
+            _, S_between, Vt_between = scipy.linalg.svd(
+                X_between, full_matrices=False, check_finite=False
+            )
+        else:
+            _, S_between, Vt_between = xp.linalg.svd(
+                X_between, full_matrices=False
+            )
+
+        if self._max_components == 0:
+            self.explained_variance_ratio_ = xp.zeros(
+                (0,), dtype=S_between.dtype, device=dev
+            )
+        else:
+            s2_sum = xp.sum(S_between**2)
+            if float(s2_sum) > 0:
+                self.explained_variance_ratio_ = (S_between**2 / s2_sum)[
+                    : self._max_components
+                ]
+            else:
+                self.explained_variance_ratio_ = xp.zeros(
+                    min(len(S_between), self._max_components),
+                    dtype=S_between.dtype,
+                    device=dev,
+                )
+
+        if len(S_between) > 0:
+            rank_between = int(
+                xp.sum(xp.astype(S_between > self.tol * S_between[0], xp.int32))
+            )
+        else:
+            rank_between = 0
+        if rank_between == 0:
+            rank_between = 1
+        self.scalings_ = scalings @ Vt_between.T[:, :rank_between]
+        coef = (self.means_ - self.xbar_) @ self.scalings_
+        self.intercept_ = -0.5 * xp.sum(coef**2, axis=1) + xp.log(self.priors_)
+        self.coef_ = coef @ self.scalings_.T
+        self.intercept_ = self.intercept_ - self.xbar_ @ self.coef_.T
+
+        # Binary case: reduce to 1D output
+        if len(self.classes_) == 2:
+            self.coef_ = xp.expand_dims(
+                self.coef_[1, :] - self.coef_[0, :], axis=0
+            )
+            diff = self.intercept_[1] - self.intercept_[0]
+            self.intercept_ = xp.reshape(diff, (1,))
+
+        # Compute pooled within-class covariance if requested
+        if self.store_covariance:
+            SVt = xp.expand_dims(self._unscaled_S, axis=1) * self._unscaled_Vt
+            self.covariance_ = (SVt.T @ SVt) / N_total
+
+        self._n_features_out = self._max_components
+        self._svd_attrs_stale = False
+
+    def _partial_fit_svd(self, X, y, first_call):
+        """Incremental SVD update for partial_fit.
+
+        Maintains a compact SVD factorization (S, Vt) of all within-class
+        centered data seen so far, avoiding O(D^2) covariance storage.
+        Model attributes (coef_, intercept_, scalings_, etc.) are computed
+        lazily on first access after this method returns.
+
+        Array API compatible: tensors stay on-device (CPU/CUDA).
+
+        Parameters
+        ----------
+        X : array of shape (n_samples, n_features)
+            Training data (already validated).
+
+        y : array of shape (n_samples,)
+            Target values (already validated).
+
+        first_call : bool
+            Whether this is the first call to partial_fit.
+        """
+        xp, _ = get_namespace(X)
+        dev = device(X)
+        _, n_features = X.shape
+        n_classes = len(self.classes_)
+
+        # --- Initialize streaming state ---
+        if first_call or not hasattr(self, "_unscaled_S"):
+            self._clear_prediction_attrs()
+            self._array_ns = xp
+            self._array_device = dev
+            self._class_counts = xp.zeros(n_classes, dtype=xp.float64, device=dev)
+            self.means_ = xp.zeros(
+                (n_classes, n_features), dtype=xp.float64, device=dev
+            )
+            self._unscaled_S = xp.zeros(0, dtype=xp.float64, device=dev)
+            self._unscaled_Vt = xp.zeros(
+                (0, n_features), dtype=xp.float64, device=dev
+            )
+            self._within_sum_sq = xp.zeros(n_features, dtype=xp.float64, device=dev)
+
+        # --- Per-chunk: compute local stats ---
+        chunk_means = xp.zeros(
+            (n_classes, n_features), dtype=xp.float64, device=dev
+        )
+        chunk_counts = xp.zeros(n_classes, dtype=xp.float64, device=dev)
+        chunk_sum_sq = xp.zeros(
+            (n_classes, n_features), dtype=xp.float64, device=dev
+        )
+        for idx, c in enumerate(self.classes_):
+            mask = y == c
+            m_k = int(xp.sum(xp.astype(mask, xp.int32)))
+            if m_k > 0:
+                Xg = X[mask]
+                chunk_means[idx] = xp.mean(Xg, axis=0)
+                chunk_counts[idx] = m_k
+                chunk_sum_sq[idx] = xp.sum((Xg - chunk_means[idx]) ** 2, axis=0)
+
+        # --- Compute mean-shift correction vectors (parallel axis theorem) ---
+        mean_shift_rows = []
+        for idx in range(n_classes):
+            N_old = float(self._class_counts[idx])
+            N_chunk = float(chunk_counts[idx])
+            if N_old > 0 and N_chunk > 0:
+                N_new = N_old + N_chunk
+                weight = math.sqrt(N_old * N_chunk / N_new)
+                mean_shift_rows.append(weight * (self.means_[idx] - chunk_means[idx]))
+
+        # --- Update within-class sum-of-squares (Chan's parallel formula) ---
+        for idx in range(n_classes):
+            m_k = float(chunk_counts[idx])
+            if m_k == 0:
+                continue
+            N_old = float(self._class_counts[idx])
+            delta = chunk_means[idx] - self.means_[idx]
+            if N_old > 0:
+                N_new = N_old + m_k
+                self._within_sum_sq = self._within_sum_sq + (
+                    chunk_sum_sq[idx] + (N_old * m_k / N_new) * delta**2
+                )
+            else:
+                self._within_sum_sq = self._within_sum_sq + chunk_sum_sq[idx]
+
+        # --- Update global means and counts ---
+        for idx in range(n_classes):
+            m_k = float(chunk_counts[idx])
+            if m_k == 0:
+                continue
+            N_old = float(self._class_counts[idx])
+            N_new = N_old + m_k
+            delta = chunk_means[idx] - self.means_[idx]
+            self.means_[idx] = self.means_[idx] + (m_k / N_new) * delta
+            self._class_counts[idx] = N_new
+
+        # --- Center chunk by local class means ---
+        # Build per-class centered blocks and concat (Array API compatible;
+        # avoids boolean-indexed assignment which isn't universally supported).
+        Xc_parts = []
+        for idx, c in enumerate(self.classes_):
+            mask = y == c
+            if int(xp.sum(xp.astype(mask, xp.int32))) > 0:
+                Xc_parts.append(X[mask] - chunk_means[idx])
+        Xc = xp.concat(Xc_parts, axis=0) if Xc_parts else X[:0]
+
+        # --- Build block matrix Z ---
+        rank_old = self._unscaled_S.shape[0]
+        Z_parts = []
+        if rank_old > 0:
+            Z_parts.append(
+                xp.expand_dims(self._unscaled_S, axis=1) * self._unscaled_Vt
+            )
+        Z_parts.append(xp.astype(Xc, xp.float64))
+        Z_parts.extend(
+            xp.expand_dims(xp.astype(row, xp.float64), axis=0)
+            for row in mean_shift_rows
+        )
+        Z = xp.concat(Z_parts, axis=0) if Z_parts else xp.zeros(
+            (0, n_features), dtype=xp.float64, device=dev
+        )
+
+        # --- SVD of block matrix ---
+        if _is_numpy_namespace(xp):
+            _, S_new, Vt_new = scipy.linalg.svd(
+                Z, full_matrices=False, check_finite=False
+            )
+        else:
+            _, S_new, Vt_new = xp.linalg.svd(Z, full_matrices=False)
+
+        # Truncate negligible components using relative rank filtering
+        # (scale-independent, unlike absolute self.tol).
+        # Singular values are sorted descending, so the keep mask is a prefix.
+        if S_new.shape[0] > 0:
+            eps = float(xp.finfo(Z.dtype).eps)
+            threshold = eps * max(Z.shape) * float(S_new[0])
+            # Find rank: singular values are sorted, so find first below threshold
+            rank = 0
+            for i in range(S_new.shape[0]):
+                if float(S_new[i]) > threshold:
+                    rank = i + 1
+                else:
+                    break
+        else:
+            rank = 0
+        self._unscaled_S = S_new[:rank]
+        self._unscaled_Vt = Vt_new[:rank]
+
+        # --- Early return if not all classes seen or insufficient df ---
+        n_classes_seen = int(
+            xp.sum(xp.astype(self._class_counts > 0, xp.int32))
+        )
+        N_total = float(xp.sum(self._class_counts))
+        if n_classes_seen < n_classes or N_total <= n_classes_seen:
+            return
+
+        # --- Derive priors (cheap, needed by tests and _reconstruct) ---
+        if self.priors is not None:
+            self.priors_ = xp.asarray(
+                self.priors, dtype=xp.float64, device=dev
+            )
+            if xp.any(self.priors_ < 0):
+                raise ValueError("priors must be non-negative")
+            if abs(float(xp.sum(self.priors_)) - 1.0) > 1e-5:
+                warnings.warn(
+                    "The priors do not sum to 1. Renormalizing",
+                    UserWarning,
+                )
+                self.priors_ = self.priors_ / xp.sum(self.priors_)
+        else:
+            self.priors_ = self._class_counts / N_total
+
+        # --- Maximum number of components (cheap) ---
+        max_components = min(n_classes - 1, n_features)
+        if self.n_components is None:
+            self._max_components = max_components
+        else:
+            if self.n_components > max_components:
+                raise ValueError(
+                    "n_components cannot be larger than min(n_features, n_classes - 1)."
+                )
+            self._max_components = self.n_components
+        self._n_features_out = self._max_components
+
+        # --- Mark expensive model attributes as stale (deferred) ---
+        self._invalidate_svd_attrs()
 
     @_fit_context(
         # LinearDiscriminantAnalysis.covariance_estimator is not validated yet
@@ -729,6 +1138,272 @@ class LinearDiscriminantAnalysis(
         self._n_features_out = self._max_components
         return self
 
+    @_fit_context(
+        # LinearDiscriminantAnalysis.covariance_estimator is not validated yet
+        prefer_skip_nested_validation=False
+    )
+    def partial_fit(self, X, y, classes=None):
+        """Incrementally fit the Linear Discriminant Analysis model.
+
+        This method allows online learning by updating sufficient statistics
+        with each new batch of data using a pairwise moment-merge update [1]_:
+
+        ``S_new = S_old + S_chunk + (n_old * n_chunk / n_new) * outer(delta, delta)``
+
+        where ``delta = mean_chunk - mean_old``. This is applied per class to
+        accumulate the pooled within-class scatter matrix. The resulting model
+        is mathematically equivalent to fitting on all data at once.
+
+        .. versionadded:: 1.9
+
+        Parameters
+        ----------
+        X : array-like of shape (n_samples, n_features)
+            Training data.
+
+        y : array-like of shape (n_samples,)
+            Target values.
+
+        classes : array-like of shape (n_classes,), default=None
+            List of all classes that can possibly appear in the `y` vector.
+            Must be provided at the first call to ``partial_fit``, can be
+            omitted in subsequent calls.
+
+        Returns
+        -------
+        self : object
+            Fitted estimator.
+
+        Notes
+        -----
+        The estimator is not usable for prediction until **all** declared
+        classes (passed via ``classes`` on the first call) have been
+        observed in at least one chunk. Additionally the ``eigen`` solver
+        requires at least ``n_features`` within-class degrees of freedom.
+        Until these conditions are met, calling ``predict`` will raise
+        ``NotFittedError``.
+
+        When ``store_covariance=True`` and ``solver="svd"``, the pooled
+        within-class covariance matrix is reconstructed from the compact
+        SVD factorization at prediction time.
+
+        References
+        ----------
+        .. [1] T. F. Chan, G. H. Golub, and R. J. LeVeque, "Updating formulae
+               and a pairwise algorithm for computing sample variances,"
+               Technical Report STAN-CS-79-773, Stanford University, 1979.
+
+        .. [2] T. F. Chan, G. H. Golub, and R. J. LeVeque, "Algorithms for
+               computing the sample variance: Analysis and recommendations,"
+               The American Statistician, vol. 37, no. 3, pp. 242-247, 1983.
+        """
+        if self.solver != "svd":
+            if self.shrinkage == "auto" or self.covariance_estimator is not None:
+                raise NotImplementedError(
+                    "partial_fit does not support shrinkage='auto' or a custom "
+                    "covariance_estimator. Use a float shrinkage value or None."
+                )
+
+        first_call = _check_partial_fit_first_call(self, classes)
+
+        xp, is_array_api = get_namespace(X)
+
+        X, y = validate_data(
+            self,
+            X,
+            y,
+            ensure_min_samples=1,
+            dtype=[xp.float64, xp.float32],
+            reset=first_call,
+        )
+
+        # Convert to NumPy when needed for solver dependencies.
+        # SVD path: keep tensors on-device (Array API compatible).
+        # MPS exception: lacks float64 — convert to NumPy to avoid silent
+        # precision loss (unified memory makes the copy ~free).
+        # Covariance path (eigen/lsqr): always convert (scipy deps).
+        if is_array_api:
+            if self.solver != "svd":
+                X = _convert_to_numpy(X, xp)
+                y = _convert_to_numpy(y, xp)
+            elif _max_precision_float_dtype(xp, device(X)) != xp.float64:
+                # MPS or other devices lacking float64
+                X = _convert_to_numpy(X, xp).astype(np.float64)
+                y = _convert_to_numpy(y, xp)
+
+        # Validate that y contains only known classes (numpy for setdiff1d)
+        if is_array_api and not isinstance(y, np.ndarray):
+            y_np = _convert_to_numpy(y, xp)
+        else:
+            y_np = y
+        unexpected = np.setdiff1d(y_np, np.asarray(self.classes_))
+        if len(unexpected) > 0:
+            raise ValueError(
+                f"The target label(s) {unexpected} in y do not exist "
+                f"in the initial classes {self.classes_}"
+            )
+
+        # Route to solver-specific method
+        if self.solver == "svd":
+            self._partial_fit_svd(X, y, first_call)
+        else:
+            self._partial_fit_covariance(X, y, first_call)
+
+            # Binary case: reduce to 1D output (SVD handles this lazily
+            # in _reconstruct_svd_attrs)
+            if (
+                hasattr(self, "coef_")
+                and self.coef_.shape[0] == len(self.classes_) == 2
+            ):
+                self.coef_ = (self.coef_[1, :] - self.coef_[0, :])[np.newaxis, :]
+                self.intercept_ = np.array([self.intercept_[1] - self.intercept_[0]])
+
+            if hasattr(self, "_max_components"):
+                self._n_features_out = self._max_components
+
+        return self
+
+    def _partial_fit_covariance(self, X, y, first_call):
+        """Covariance-based incremental update for partial_fit.
+
+        Uses Chan's parallel variance update to accumulate the pooled
+        within-class scatter matrix. Used by eigen and lsqr solvers.
+
+        Parameters
+        ----------
+        X : ndarray of shape (n_samples, n_features)
+            Training data (already validated).
+
+        y : ndarray of shape (n_samples,)
+            Target values (already validated).
+
+        first_call : bool
+            Whether this is the first call to partial_fit.
+        """
+        n_features = X.shape[1]
+        n_classes = len(self.classes_)
+
+        if first_call or not hasattr(self, "_class_counts"):
+            # Reinitialize accumulators on first call or after a prior
+            # fit() call which does not set these private attributes.
+            self._clear_prediction_attrs()
+            self._class_counts = np.zeros(n_classes, dtype=np.float64)
+            self.means_ = np.zeros((n_classes, n_features), dtype=np.float64)
+            self._unscaled_covariance = np.zeros(
+                (n_features, n_features), dtype=np.float64
+            )
+
+        # --- Chan's parallel variance update per class ---
+        for idx, c in enumerate(self.classes_):
+            X_k = X[y == c]
+            m_k = X_k.shape[0]
+            if m_k == 0:
+                continue
+
+            chunk_mean = np.mean(X_k, axis=0)
+            if m_k == 1:
+                S_chunk = np.zeros((n_features, n_features), dtype=np.float64)
+            else:
+                X_k_centered = X_k - chunk_mean
+                S_chunk = X_k_centered.T @ X_k_centered
+
+            N_k_old = self._class_counts[idx]
+            N_k_new = N_k_old + m_k
+            delta = chunk_mean - self.means_[idx]
+
+            self._unscaled_covariance += S_chunk + (N_k_old * m_k / N_k_new) * np.outer(
+                delta, delta
+            )
+            self.means_[idx] += (m_k / N_k_new) * delta
+            self._class_counts[idx] = N_k_new
+
+        # --- Derive public parameters ---
+        N_total = self._class_counts.sum()
+
+        if self.priors is not None:
+            self.priors_ = np.asarray(self.priors, dtype=np.float64)
+            if np.any(self.priors_ < 0):
+                raise ValueError("priors must be non-negative")
+            if np.abs(np.sum(self.priors_) - 1.0) > 1e-5:
+                warnings.warn(
+                    "The priors do not sum to 1. Renormalizing",
+                    UserWarning,
+                )
+                self.priors_ = self.priors_ / self.priors_.sum()
+        else:
+            self.priors_ = self._class_counts / N_total
+
+        # Cannot solve until all declared classes have been observed.
+        # For the eigen solver, also require enough within-class degrees
+        # of freedom for a non-singular covariance matrix.
+        n_classes_seen = np.count_nonzero(self._class_counts)
+        within_df = N_total - n_classes_seen
+        if n_classes_seen < n_classes or (
+            self.solver == "eigen" and within_df < n_features
+        ):
+            return
+
+        # Maximum number of components
+        max_components = min(n_classes - 1, n_features)
+        if self.n_components is None:
+            self._max_components = max_components
+        else:
+            if self.n_components > max_components:
+                raise ValueError(
+                    "n_components cannot be larger than min(n_features, n_classes - 1)."
+                )
+            self._max_components = self.n_components
+
+        covariance = self._unscaled_covariance / N_total
+
+        # Apply explicit float shrinkage
+        if self.shrinkage is not None:
+            covariance = shrunk_covariance(covariance, self.shrinkage)
+
+        self.covariance_ = covariance
+
+        if self.solver == "eigen":
+            # Reconstruct between-class scatter
+            mu_global = np.average(self.means_, axis=0, weights=self._class_counts)
+            Sb = (
+                sum(
+                    self._class_counts[i]
+                    * np.outer(self.means_[i] - mu_global, self.means_[i] - mu_global)
+                    for i in range(n_classes)
+                )
+                / N_total
+            )
+
+            if self.shrinkage is not None:
+                St = shrunk_covariance(
+                    (
+                        self._unscaled_covariance
+                        + sum(
+                            self._class_counts[i]
+                            * np.outer(
+                                self.means_[i] - mu_global,
+                                self.means_[i] - mu_global,
+                            )
+                            for i in range(n_classes)
+                        )
+                    )
+                    / N_total,
+                    self.shrinkage,
+                )
+                Sb = St - covariance
+
+            self._solve_eigen_from_matrices(Sb=Sb, Sw=covariance)
+        elif self.solver == "lsqr":
+            self._solve_lsqr_from_covariance(covariance)
+
+    def __sklearn_is_fitted__(self):
+        """Check fitted status by verifying solver output exists."""
+        # For SVD streaming: attrs are lazily reconstructed, but the model
+        # is fitted once we have sufficient statistics.
+        if self.__dict__.get("_svd_attrs_stale", False):
+            return True
+        return "coef_" in self.__dict__
+
     def transform(self, X):
         """Project data to maximize class separation.
 
@@ -749,6 +1424,7 @@ class LinearDiscriminantAnalysis(
                 "transform not implemented for 'lsqr' solver (use 'svd' or 'eigen')."
             )
         check_is_fitted(self)
+        self._ensure_svd_attrs()
         X = validate_data(self, X, reset=False)
 
         if self.solver == "svd":

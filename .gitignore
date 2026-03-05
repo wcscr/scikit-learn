@@ -96,3 +96,14 @@ jupyterlite_contents
 
 # file recognised by vscode IDEs containing env variables
 .env
+
+# Local development files (docker, notebooks, benchmarks)
+.docker/
+output/
+benchmarks/bench_lda_svd_partial_fit_parity.py
+
+.claude/
+.venv/
+.venv-docker/
+.venv-local/
+data/
