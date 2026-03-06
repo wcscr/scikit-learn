@@ -1,0 +1,129 @@
+LDA partial_fit stress test
+Scenarios: mnist, fashion_mnist, covertype
+Solvers:   svd, eigen, lsqr
+Quick:     False
+CV:        single holdout
+CUDA:      False
+
+--- Running scenario: mnist  [backend: numpy/CPU] ---
+  Fetching mnist_784 from OpenML...
+  Loaded mnist_784: (70000, 784)
+  Data: (70000, 784), classes=10, eval=holdout, chunks=[10000, 35000, 70000]
+  Batch svd cs=10000 [holdout]...
+  Batch svd [holdout]: acc=0.8663, time=3.48s
+  Stream svd cs=10000 [holdout]...
+  Stream svd cs=10000 [holdout]: time=4.75s
+  Result (holdout): PASS | acc=0.8663 agree=1.0000
+  Batch svd cs=35000 [holdout]...
+  Batch svd [holdout]: acc=0.8663, time=3.29s
+  Stream svd cs=35000 [holdout]...
+  Stream svd cs=35000 [holdout]: time=3.51s
+  Result (holdout): PASS | acc=0.8663 agree=1.0000
+  Batch svd cs=70000 [holdout]...
+  Batch svd [holdout]: acc=0.8663, time=3.50s
+  Stream svd cs=70000 [holdout]...
+  Stream svd cs=70000 [holdout]: time=3.19s
+  Result (holdout): PASS | acc=0.8663 agree=1.0000
+  Batch eigen cs=10000 [holdout]...
+  ERROR: The leading minor of order 1 of B is not positive definite. The factorization of B could not be completed and no eigenvalues or eigenvectors were computed.
+  Backend: N/A
+  0 passed, 1 failed, 0 skipped
+  WARN [N/A cs=0]: Exception: The leading minor of order 1 of B is not positive definite. The factorization of B could not be completed and no eigenvalues or eigenvectors were computed.
+
+--- Running scenario: fashion_mnist  [backend: numpy/CPU] ---
+  Fetching Fashion-MNIST from OpenML...
+  Loaded Fashion-MNIST: (70000, 784)
+  Data: (70000, 784), classes=10, eval=holdout, chunks=[10000, 35000, 70000]
+  Batch svd cs=10000 [holdout]...
+  Batch svd [holdout]: acc=0.8162, time=3.48s
+  Stream svd cs=10000 [holdout]...
+  Stream svd cs=10000 [holdout]: time=5.09s
+  Result (holdout): PASS | acc=0.8162 agree=1.0000
+  Batch svd cs=35000 [holdout]...
+  Batch svd [holdout]: acc=0.8162, time=3.43s
+  Stream svd cs=35000 [holdout]...
+  Stream svd cs=35000 [holdout]: time=3.63s
+  Result (holdout): PASS | acc=0.8162 agree=1.0000
+  Batch svd cs=70000 [holdout]...
+  Batch svd [holdout]: acc=0.8162, time=3.46s
+  Stream svd cs=70000 [holdout]...
+  Stream svd cs=70000 [holdout]: time=3.33s
+  Result (holdout): PASS | acc=0.8162 agree=1.0000
+  Batch eigen cs=10000 [holdout]...
+  Batch eigen [holdout]: acc=0.8162, time=1.08s
+  Stream eigen cs=10000 [holdout]...
+  Stream eigen cs=10000 [holdout]: time=1.72s
+  Result (holdout): PASS | acc=0.8162 agree=1.0000
+  Batch eigen cs=35000 [holdout]...
+  Batch eigen [holdout]: acc=0.8162, time=1.04s
+  Stream eigen cs=35000 [holdout]...
+  Stream eigen cs=35000 [holdout]: time=0.89s
+  Result (holdout): PASS | acc=0.8162 agree=1.0000
+  Batch eigen cs=70000 [holdout]...
+  Batch eigen [holdout]: acc=0.8162, time=1.03s
+  Stream eigen cs=70000 [holdout]...
+  Stream eigen cs=70000 [holdout]: time=0.50s
+  Result (holdout): PASS | acc=0.8162 agree=1.0000
+  Batch lsqr cs=10000 [holdout]...
+  Batch lsqr [holdout]: acc=0.8162, time=0.81s
+  Stream lsqr cs=10000 [holdout]...
+  Stream lsqr cs=10000 [holdout]: time=2.17s
+  Result (holdout): PASS | acc=0.8162 agree=1.0000
+  Batch lsqr cs=35000 [holdout]...
+  Batch lsqr [holdout]: acc=0.8162, time=0.83s
+  Stream lsqr cs=35000 [holdout]...
+  Stream lsqr cs=35000 [holdout]: time=1.01s
+  Result (holdout): PASS | acc=0.8162 agree=1.0000
+  Batch lsqr cs=70000 [holdout]...
+  Batch lsqr [holdout]: acc=0.8162, time=0.75s
+  Stream lsqr cs=70000 [holdout]...
+  Stream lsqr cs=70000 [holdout]: time=0.58s
+  Result (holdout): PASS | acc=0.8162 agree=1.0000
+  Backend: numpy
+  9 passed, 0 failed, 0 skipped
+
+--- Running scenario: covertype  [backend: numpy/CPU] ---
+  Fetching Covertype dataset...
+  Data: (581012, 54), classes=7, eval=holdout, chunks=[50000, 200000, 581012]
+  Batch svd cs=50000 [holdout]...
+  Batch svd [holdout]: acc=0.6792, time=1.06s
+  Stream svd cs=50000 [holdout]...
+  Stream svd cs=50000 [holdout]: time=0.96s
+  Result (holdout): PASS | acc=0.6792 agree=1.0000
+  Batch svd cs=200000 [holdout]...
+  Batch svd [holdout]: acc=0.6792, time=1.05s
+  Stream svd cs=200000 [holdout]...
+  Stream svd cs=200000 [holdout]: time=0.96s
+  Result (holdout): PASS | acc=0.6792 agree=1.0000
+  Batch svd cs=581012 [holdout]...
+  Batch svd [holdout]: acc=0.6792, time=1.03s
+  Stream svd cs=581012 [holdout]...
+  Stream svd cs=581012 [holdout]: time=0.96s
+  Result (holdout): PASS | acc=0.6792 agree=1.0000
+  Batch eigen cs=50000 [holdout]...
+  ERROR: The leading minor of order 14 of B is not positive definite. The factorization of B could not be completed and no eigenvalues or eigenvectors were computed.
+  Backend: N/A
+  0 passed, 1 failed, 0 skipped
+  WARN [N/A cs=0]: Exception: The leading minor of order 14 of B is not positive definite. The factorization of B could not be completed and no eigenvalues or eigenvectors were computed.
+
+================================================================================
+SUMMARY
+================================================================================
+scenario         solver backend      chunk  acc_bat  acc_str    agree    delta   t_bat   t_str  pass
+----------------------------------------------------------------------------------------------------
+mnist            N/A    N/A              0      nan      nan      nan     +nan     nan     nan  FAIL
+fashion_mnist    svd    numpy        10000   0.8162   0.8162   1.0000  +0.0000    3.48    5.09  PASS
+fashion_mnist    svd    numpy        35000   0.8162   0.8162   1.0000  +0.0000    3.43    3.63  PASS
+fashion_mnist    svd    numpy        70000   0.8162   0.8162   1.0000  +0.0000    3.46    3.33  PASS
+fashion_mnist    eigen  numpy        10000   0.8162   0.8162   1.0000  +0.0000    1.08    1.72  PASS
+fashion_mnist    eigen  numpy        35000   0.8162   0.8162   1.0000  +0.0000    1.04    0.89  PASS
+fashion_mnist    eigen  numpy        70000   0.8162   0.8162   1.0000  +0.0000    1.03    0.50  PASS
+fashion_mnist    lsqr   numpy        10000   0.8162   0.8162   1.0000  +0.0000    0.81    2.17  PASS
+fashion_mnist    lsqr   numpy        35000   0.8162   0.8162   1.0000  +0.0000    0.83    1.01  PASS
+fashion_mnist    lsqr   numpy        70000   0.8162   0.8162   1.0000  +0.0000    0.75    0.58  PASS
+covertype        N/A    N/A              0      nan      nan      nan     +nan     nan     nan  FAIL
+
+Total: 11 | Passed: 9 | Failed: 2 | Skipped: 0
+Overall: FAIL
+
+JSON report written to: /workspace/benchmarks/results/stress_test_public.json

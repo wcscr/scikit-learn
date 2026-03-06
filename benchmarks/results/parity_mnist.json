@@ -1,0 +1,54 @@
+{
+  "mode": "mnist",
+  "pass": true,
+  "reports": [
+    {
+      "mode": "mnist",
+      "chunk_sizes": [
+        256,
+        512,
+        1024,
+        2048
+      ],
+      "acc_delta_threshold": -0.01,
+      "agreement_threshold": 0.999,
+      "acc_floor": 0.75,
+      "sample_size": 5000,
+      "pass": true,
+      "chunks": [
+        {
+          "chunk_size": 256,
+          "acc_batch": 0.817,
+          "acc_stream": 0.817,
+          "acc_delta": 0.0,
+          "pred_agreement": 1.0,
+          "pass": true
+        },
+        {
+          "chunk_size": 512,
+          "acc_batch": 0.817,
+          "acc_stream": 0.817,
+          "acc_delta": 0.0,
+          "pred_agreement": 1.0,
+          "pass": true
+        },
+        {
+          "chunk_size": 1024,
+          "acc_batch": 0.817,
+          "acc_stream": 0.817,
+          "acc_delta": 0.0,
+          "pred_agreement": 1.0,
+          "pass": true
+        },
+        {
+          "chunk_size": 2048,
+          "acc_batch": 0.817,
+          "acc_stream": 0.817,
+          "acc_delta": 0.0,
+          "pred_agreement": 1.0,
+          "pass": true
+        }
+      ]
+    }
+  ]
+}
