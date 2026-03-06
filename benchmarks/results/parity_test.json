@@ -1,0 +1,290 @@
+{
+  "mode": "synthetic",
+  "pass": true,
+  "reports": [
+    {
+      "mode": "synthetic",
+      "seeds": [
+        0,
+        7,
+        11,
+        16
+      ],
+      "chunk_sizes": [
+        1,
+        2,
+        7,
+        64,
+        700
+      ],
+      "agreement_threshold": 0.87,
+      "acc_delta_threshold": -0.01,
+      "proba_atol": 1e-10,
+      "proba_rtol": 1e-07,
+      "strict_parity": false,
+      "per_seed": {
+        "0": {
+          "pass": true,
+          "chunks": [
+            {
+              "chunk_size": 1,
+              "pred_mismatch": 0,
+              "pred_agreement": 1.0,
+              "max_proba_abs_err": 6.031841692788475e-13,
+              "proba_close": true,
+              "acc_batch": 0.85,
+              "acc_stream": 0.85,
+              "acc_delta": 0.0,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 2,
+              "pred_mismatch": 0,
+              "pred_agreement": 1.0,
+              "max_proba_abs_err": 3.158029393546258e-13,
+              "proba_close": true,
+              "acc_batch": 0.85,
+              "acc_stream": 0.85,
+              "acc_delta": 0.0,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 7,
+              "pred_mismatch": 0,
+              "pred_agreement": 1.0,
+              "max_proba_abs_err": 8.12128142513302e-14,
+              "proba_close": true,
+              "acc_batch": 0.85,
+              "acc_stream": 0.85,
+              "acc_delta": 0.0,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 64,
+              "pred_mismatch": 0,
+              "pred_agreement": 1.0,
+              "max_proba_abs_err": 1.9317880628477724e-14,
+              "proba_close": true,
+              "acc_batch": 0.85,
+              "acc_stream": 0.85,
+              "acc_delta": 0.0,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 700,
+              "pred_mismatch": 0,
+              "pred_agreement": 1.0,
+              "max_proba_abs_err": 4.509360551629982e-09,
+              "proba_close": true,
+              "acc_batch": 0.85,
+              "acc_stream": 0.85,
+              "acc_delta": 0.0,
+              "chunk_stable": true,
+              "pass": true
+            }
+          ]
+        },
+        "7": {
+          "pass": true,
+          "chunks": [
+            {
+              "chunk_size": 1,
+              "pred_mismatch": 24,
+              "pred_agreement": 0.9657142857142857,
+              "max_proba_abs_err": 0.24949170003205517,
+              "proba_close": false,
+              "acc_batch": 0.9085714285714286,
+              "acc_stream": 0.9314285714285714,
+              "acc_delta": 0.022857142857142798,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 2,
+              "pred_mismatch": 24,
+              "pred_agreement": 0.9657142857142857,
+              "max_proba_abs_err": 0.24949170003204169,
+              "proba_close": false,
+              "acc_batch": 0.9085714285714286,
+              "acc_stream": 0.9314285714285714,
+              "acc_delta": 0.022857142857142798,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 7,
+              "pred_mismatch": 24,
+              "pred_agreement": 0.9657142857142857,
+              "max_proba_abs_err": 0.24949170003207893,
+              "proba_close": false,
+              "acc_batch": 0.9085714285714286,
+              "acc_stream": 0.9314285714285714,
+              "acc_delta": 0.022857142857142798,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 64,
+              "pred_mismatch": 24,
+              "pred_agreement": 0.9657142857142857,
+              "max_proba_abs_err": 0.24949170003207183,
+              "proba_close": false,
+              "acc_batch": 0.9085714285714286,
+              "acc_stream": 0.9314285714285714,
+              "acc_delta": 0.022857142857142798,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 700,
+              "pred_mismatch": 24,
+              "pred_agreement": 0.9657142857142857,
+              "max_proba_abs_err": 0.249491699041055,
+              "proba_close": false,
+              "acc_batch": 0.9085714285714286,
+              "acc_stream": 0.9314285714285714,
+              "acc_delta": 0.022857142857142798,
+              "chunk_stable": true,
+              "pass": true
+            }
+          ]
+        },
+        "11": {
+          "pass": true,
+          "chunks": [
+            {
+              "chunk_size": 1,
+              "pred_mismatch": 57,
+              "pred_agreement": 0.9185714285714286,
+              "max_proba_abs_err": 0.39785321431228204,
+              "proba_close": false,
+              "acc_batch": 0.8385714285714285,
+              "acc_stream": 0.8471428571428572,
+              "acc_delta": 0.008571428571428674,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 2,
+              "pred_mismatch": 57,
+              "pred_agreement": 0.9185714285714286,
+              "max_proba_abs_err": 0.3978532143122822,
+              "proba_close": false,
+              "acc_batch": 0.8385714285714285,
+              "acc_stream": 0.8471428571428572,
+              "acc_delta": 0.008571428571428674,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 7,
+              "pred_mismatch": 57,
+              "pred_agreement": 0.9185714285714286,
+              "max_proba_abs_err": 0.3978532143122716,
+              "proba_close": false,
+              "acc_batch": 0.8385714285714285,
+              "acc_stream": 0.8471428571428572,
+              "acc_delta": 0.008571428571428674,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 64,
+              "pred_mismatch": 57,
+              "pred_agreement": 0.9185714285714286,
+              "max_proba_abs_err": 0.39785321431227844,
+              "proba_close": false,
+              "acc_batch": 0.8385714285714285,
+              "acc_stream": 0.8471428571428572,
+              "acc_delta": 0.008571428571428674,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 700,
+              "pred_mismatch": 57,
+              "pred_agreement": 0.9185714285714286,
+              "max_proba_abs_err": 0.3978532169318014,
+              "proba_close": false,
+              "acc_batch": 0.8385714285714285,
+              "acc_stream": 0.8471428571428572,
+              "acc_delta": 0.008571428571428674,
+              "chunk_stable": true,
+              "pass": true
+            }
+          ]
+        },
+        "16": {
+          "pass": true,
+          "chunks": [
+            {
+              "chunk_size": 1,
+              "pred_mismatch": 40,
+              "pred_agreement": 0.9428571428571428,
+              "max_proba_abs_err": 0.38971895813411744,
+              "proba_close": false,
+              "acc_batch": 0.86,
+              "acc_stream": 0.89,
+              "acc_delta": 0.030000000000000027,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 2,
+              "pred_mismatch": 40,
+              "pred_agreement": 0.9428571428571428,
+              "max_proba_abs_err": 0.3897189581341331,
+              "proba_close": false,
+              "acc_batch": 0.86,
+              "acc_stream": 0.89,
+              "acc_delta": 0.030000000000000027,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 7,
+              "pred_mismatch": 40,
+              "pred_agreement": 0.9428571428571428,
+              "max_proba_abs_err": 0.389718958134142,
+              "proba_close": false,
+              "acc_batch": 0.86,
+              "acc_stream": 0.89,
+              "acc_delta": 0.030000000000000027,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 64,
+              "pred_mismatch": 40,
+              "pred_agreement": 0.9428571428571428,
+              "max_proba_abs_err": 0.38971895813415264,
+              "proba_close": false,
+              "acc_batch": 0.86,
+              "acc_stream": 0.89,
+              "acc_delta": 0.030000000000000027,
+              "chunk_stable": true,
+              "pass": true
+            },
+            {
+              "chunk_size": 700,
+              "pred_mismatch": 40,
+              "pred_agreement": 0.9428571428571428,
+              "max_proba_abs_err": 0.3897189576480848,
+              "proba_close": false,
+              "acc_batch": 0.86,
+              "acc_stream": 0.89,
+              "acc_delta": 0.030000000000000027,
+              "chunk_stable": true,
+              "pass": true
+            }
+          ]
+        }
+      },
+      "pass": true
+    }
+  ]
+}

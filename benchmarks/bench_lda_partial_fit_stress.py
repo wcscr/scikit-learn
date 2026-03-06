@@ -1015,8 +1015,83 @@ def scenario_covertype(args):
     )
 
 
+# --- Scenarios: ill-conditioned datasets with shrinkage (eigen/lsqr) ---
+# These datasets have singular within-class covariance matrices, causing
+# eigen/lsqr to fail without regularization.  Shrinkage fixes this.
+
+_SHRINKAGE_VALUE = 0.01
+
+
+def scenario_mnist_shrinkage(args):
+    return _run_public_dataset(
+        args,
+        scenario_name="mnist_shrinkage",
+        openml_name="mnist_784",
+        openml_version=1,
+        chunk_sizes=[10000, 35000, 70000],
+        shrinkage=_SHRINKAGE_VALUE,
+        solvers=["eigen", "lsqr"],
+    )
+
+
+def scenario_fashion_mnist_shrinkage(args):
+    return _run_public_dataset(
+        args,
+        scenario_name="fashion_mnist_shrinkage",
+        openml_name="Fashion-MNIST",
+        openml_version=1,
+        chunk_sizes=[10000, 35000, 70000],
+        shrinkage=_SHRINKAGE_VALUE,
+        solvers=["eigen", "lsqr"],
+    )
+
+
+def scenario_covertype_shrinkage(args):
+    if os.environ.get("SKLEARN_SKIP_NETWORK_TESTS", "1") != "0":
+        r = ScenarioResult(
+            scenario="covertype_shrinkage", solver="N/A", backend="numpy",
+            chunk_size=0, n_samples=0, n_features=0, n_classes=0,
+            skipped=True, skip_reason="SKLEARN_SKIP_NETWORK_TESTS != 0",
+        )
+        return [r]
+    try:
+        _log("Fetching Covertype dataset...")
+        from sklearn.datasets import fetch_covtype
+
+        data = fetch_covtype()
+        X_all = np.asarray(data.data, dtype=np.float64)
+        y_all = np.asarray(data.target, dtype=np.int64)
+    except Exception as exc:
+        r = ScenarioResult(
+            scenario="covertype_shrinkage", solver="N/A", backend="numpy",
+            chunk_size=0, n_samples=0, n_features=0, n_classes=0,
+            skipped=True, skip_reason=f"fetch failed: {exc}",
+        )
+        return [r]
+
+    chunk_sizes = [50000, 200000, 581012]
+    if args.quick:
+        rng = np.random.RandomState(42)
+        idx = rng.choice(len(X_all), size=min(20000, len(X_all)), replace=False)
+        X_all, y_all = X_all[idx], y_all[idx]
+        chunk_sizes = [5000, 10000, 20000]
+
+    return _run_with_data(
+        args,
+        scenario_name="covertype_shrinkage",
+        X_all=X_all,
+        y_all=y_all,
+        chunk_sizes=chunk_sizes,
+        thresholds=TIER_PUBLIC,
+        tier="tight",
+        shrinkage=_SHRINKAGE_VALUE,
+        solvers=["eigen", "lsqr"],
+    )
+
+
 def _run_public_dataset(
     args, scenario_name, openml_name, openml_version, chunk_sizes,
+    shrinkage=None, solvers=None,
 ):
     """Common runner for OpenML datasets."""
     if os.environ.get("SKLEARN_SKIP_NETWORK_TESTS", "1") != "0":
@@ -1061,11 +1136,13 @@ def _run_public_dataset(
         chunk_sizes=chunk_sizes,
         thresholds=TIER_PUBLIC,
         tier="tight",
+        shrinkage=shrinkage,
+        solvers=solvers,
     )
 
 
 def _run_with_data(args, scenario_name, X_all, y_all, chunk_sizes,
-                   thresholds, tier):
+                   thresholds, tier, shrinkage=None, solvers=None):
     """Run batch + streaming comparison on pre-loaded data.
 
     Uses k-fold CV (``args.n_folds``) by default, or a single 80/20 holdout
@@ -1094,8 +1171,8 @@ def _run_with_data(args, scenario_name, X_all, y_all, chunk_sizes,
          f"eval={cv_label}, chunks={chunk_sizes}")
 
     results = []
-    for solver in args.solvers:
-        solver_shrinkage = None
+    for solver in (solvers or args.solvers):
+        solver_shrinkage = shrinkage
 
         for cs in chunk_sizes:
             # Accumulate metrics across folds
@@ -1423,6 +1500,10 @@ SCENARIOS = {
     "mnist": scenario_mnist,
     "fashion_mnist": scenario_fashion_mnist,
     "covertype": scenario_covertype,
+    # Shrinkage (ill-conditioned datasets, eigen/lsqr only)
+    "mnist_shrinkage": scenario_mnist_shrinkage,
+    "fashion_mnist_shrinkage": scenario_fashion_mnist_shrinkage,
+    "covertype_shrinkage": scenario_covertype_shrinkage,
     # GPU backends
     "torch_cpu": scenario_torch_cpu,
     "torch_cuda": scenario_torch_cuda,
@@ -1434,6 +1515,9 @@ SYNTHETIC_SCENARIOS = [
     "single_sample", "high_d", "near_singular",
 ]
 PUBLIC_SCENARIOS = ["mnist", "fashion_mnist", "covertype"]
+SHRINKAGE_SCENARIOS = [
+    "mnist_shrinkage", "fashion_mnist_shrinkage", "covertype_shrinkage",
+]
 GPU_SCENARIOS = ["torch_cpu", "torch_cuda", "cupy_cuda"]
 
 
@@ -1442,11 +1526,16 @@ def _resolve_scenarios(names):
     resolved = []
     for name in names:
         if name == "all":
-            resolved.extend(SYNTHETIC_SCENARIOS + PUBLIC_SCENARIOS + GPU_SCENARIOS)
+            resolved.extend(
+                SYNTHETIC_SCENARIOS + PUBLIC_SCENARIOS
+                + SHRINKAGE_SCENARIOS + GPU_SCENARIOS
+            )
         elif name == "synthetic":
             resolved.extend(SYNTHETIC_SCENARIOS)
         elif name == "public":
             resolved.extend(PUBLIC_SCENARIOS)
+        elif name == "shrinkage":
+            resolved.extend(SHRINKAGE_SCENARIOS)
         elif name in SCENARIOS:
             resolved.append(name)
         else:

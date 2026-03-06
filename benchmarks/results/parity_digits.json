@@ -1,0 +1,154 @@
+{
+  "mode": "digits",
+  "pass": true,
+  "reports": [
+    {
+      "mode": "digits",
+      "chunk_sizes": [
+        512,
+        1024,
+        2048
+      ],
+      "acc_delta_threshold": -0.005,
+      "agreement_threshold": 0.999,
+      "folds": [
+        {
+          "fold": 0,
+          "acc_batch": 0.9416666666666667,
+          "chunks": [
+            {
+              "chunk_size": 512,
+              "acc_stream": 0.9416666666666667,
+              "acc_delta": 0.0,
+              "pred_agreement": 1.0,
+              "pass": true
+            },
+            {
+              "chunk_size": 1024,
+              "acc_stream": 0.9416666666666667,
+              "acc_delta": 0.0,
+              "pred_agreement": 1.0,
+              "pass": true
+            },
+            {
+              "chunk_size": 2048,
+              "acc_stream": 0.9416666666666667,
+              "acc_delta": 0.0,
+              "pred_agreement": 1.0,
+              "pass": true
+            }
+          ]
+        },
+        {
+          "fold": 1,
+          "acc_batch": 0.9555555555555556,
+          "chunks": [
+            {
+              "chunk_size": 512,
+              "acc_stream": 0.9555555555555556,
+              "acc_delta": 0.0,
+              "pred_agreement": 1.0,
+              "pass": true
+            },
+            {
+              "chunk_size": 1024,
+              "acc_stream": 0.9555555555555556,
+              "acc_delta": 0.0,
+              "pred_agreement": 1.0,
+              "pass": true
+            },
+            {
+              "chunk_size": 2048,
+              "acc_stream": 0.9555555555555556,
+              "acc_delta": 0.0,
+              "pred_agreement": 1.0,
+              "pass": true
+            }
+          ]
+        },
+        {
+          "fold": 2,
+          "acc_batch": 0.9637883008356546,
+          "chunks": [
+            {
+              "chunk_size": 512,
+              "acc_stream": 0.9637883008356546,
+              "acc_delta": 0.0,
+              "pred_agreement": 1.0,
+              "pass": true
+            },
+            {
+              "chunk_size": 1024,
+              "acc_stream": 0.9637883008356546,
+              "acc_delta": 0.0,
+              "pred_agreement": 1.0,
+              "pass": true
+            },
+            {
+              "chunk_size": 2048,
+              "acc_stream": 0.9637883008356546,
+              "acc_delta": 0.0,
+              "pred_agreement": 1.0,
+              "pass": true
+            }
+          ]
+        },
+        {
+          "fold": 3,
+          "acc_batch": 0.958217270194986,
+          "chunks": [
+            {
+              "chunk_size": 512,
+              "acc_stream": 0.958217270194986,
+              "acc_delta": 0.0,
+              "pred_agreement": 1.0,
+              "pass": true
+            },
+            {
+              "chunk_size": 1024,
+              "acc_stream": 0.958217270194986,
+              "acc_delta": 0.0,
+              "pred_agreement": 1.0,
+              "pass": true
+            },
+            {
+              "chunk_size": 2048,
+              "acc_stream": 0.958217270194986,
+              "acc_delta": 0.0,
+              "pred_agreement": 1.0,
+              "pass": true
+            }
+          ]
+        },
+        {
+          "fold": 4,
+          "acc_batch": 0.947075208913649,
+          "chunks": [
+            {
+              "chunk_size": 512,
+              "acc_stream": 0.947075208913649,
+              "acc_delta": 0.0,
+              "pred_agreement": 1.0,
+              "pass": true
+            },
+            {
+              "chunk_size": 1024,
+              "acc_stream": 0.947075208913649,
+              "acc_delta": 0.0,
+              "pred_agreement": 1.0,
+              "pass": true
+            },
+            {
+              "chunk_size": 2048,
+              "acc_stream": 0.947075208913649,
+              "acc_delta": 0.0,
+              "pred_agreement": 1.0,
+              "pass": true
+            }
+          ]
+        }
+      ],
+      "pass": true
+    }
+  ]
+}
