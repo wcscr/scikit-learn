@@ -1,0 +1,9 @@
+- :class:`discriminant_analysis.LinearDiscriminantAnalysis` now supports
+  incremental learning via :meth:`partial_fit` for all three solvers
+  (``"eigen"``, ``"lsqr"``, and ``"svd"``). Streaming updates use
+  Chan's pairwise moment-merge for covariance-based solvers and an
+  incremental SVD factorization for the ``"svd"`` solver.
+  The estimator becomes fitted only after all declared classes have been
+  observed. When ``store_covariance=True``, the SVD path also computes
+  the pooled within-class covariance matrix.
+  By :user:`Will Cobb <willcobb>`.
