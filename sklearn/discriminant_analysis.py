@@ -978,9 +978,7 @@ class LinearDiscriminantAnalysis(
 
         # --- SVD of block matrix ---
         if _is_numpy_namespace(xp):
-            _, S_new, Vt_new = scipy.linalg.svd(
-                Z, full_matrices=False, check_finite=False
-            )
+            _, S_new, Vt_new = scipy.linalg.svd(Z, full_matrices=False)
         else:
             _, S_new, Vt_new = xp.linalg.svd(Z, full_matrices=False)
 
@@ -1248,7 +1246,18 @@ class LinearDiscriminantAnalysis(
                computing the sample variance: Analysis and recommendations,"
                The American Statistician, vol. 37, no. 3, pp. 242-247, 1983.
         """
-        if self.solver != "svd":
+        if self.solver == "svd":
+            if self.shrinkage is not None:
+                raise NotImplementedError(
+                    "shrinkage not supported with 'svd' solver."
+                )
+            if self.covariance_estimator is not None:
+                raise ValueError(
+                    "covariance estimator "
+                    "is not supported "
+                    "with svd solver. Try another solver"
+                )
+        else:
             if self.shrinkage == "auto" or self.covariance_estimator is not None:
                 raise NotImplementedError(
                     "partial_fit does not support shrinkage='auto' or a custom "
