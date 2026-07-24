@@ -19,6 +19,7 @@ from sklearn.base import (
     _fit_context,
 )
 from sklearn.covariance import empirical_covariance, ledoit_wolf, shrunk_covariance
+from sklearn.externals import array_api_compat
 from sklearn.linear_model._base import LinearClassifierMixin
 from sklearn.preprocessing import StandardScaler
 from sklearn.utils._array_api import (
@@ -732,6 +733,25 @@ class LinearDiscriminantAnalysis(
             self.__dict__.pop(attr, None)
         self._svd_attrs_stale = False
 
+    def _reset_streaming_state(self):
+        """Drop partial_fit accumulators and un-mark lazy attributes as stale.
+
+        Called by fit() so that a batch fit can never be silently
+        overwritten by a later lazy reconstruction from leftover streaming
+        state, and by the partial_fit reinit paths before rebuilding the
+        accumulators.
+        """
+        for attr in (
+            "_unscaled_S",
+            "_unscaled_Vt",
+            "_within_sum_sq",
+            "_class_counts",
+            "_unscaled_covariance",
+            "_class_scatter",
+        ):
+            self.__dict__.pop(attr, None)
+        self._svd_attrs_stale = False
+
     def _ensure_svd_attrs(self):
         """Reconstruct prediction attributes from compact SVD if stale."""
         if getattr(self, "_svd_attrs_stale", False):
@@ -751,8 +771,12 @@ class LinearDiscriminantAnalysis(
         Assumes priors_ and _max_components are already set by
         _partial_fit_svd.
         """
-        xp = getattr(self, "_array_ns", np)
-        dev = getattr(self, "_array_device", None)
+        # Derive the namespace/device from a stored accumulator (rather than
+        # get_namespace, which depends on config_context) so this works when
+        # called lazily outside config_context, and without holding a module
+        # reference on the instance (module objects are not picklable).
+        xp = array_api_compat.array_namespace(self._unscaled_Vt)
+        dev = device(self._unscaled_Vt)
         is_np = _is_numpy_namespace(xp)
 
         n_classes = len(self.classes_)
@@ -848,10 +872,20 @@ class LinearDiscriminantAnalysis(
             diff = self.intercept_[1] - self.intercept_[0]
             self.intercept_ = xp.reshape(diff, (1,))
 
-        # Compute pooled within-class covariance if requested
+        # Compute within-class covariance if requested
         if self.store_covariance:
-            SVt = xp.expand_dims(self._unscaled_S, axis=1) * self._unscaled_Vt
-            self.covariance_ = (SVt.T @ SVt) / N_total
+            class_scatter = getattr(self, "_class_scatter", None)
+            if class_scatter is not None:
+                # Custom priors: match batch _class_cov weighting,
+                # sum_k prior_k * S_k / N_k.
+                weights = self.priors_ / self._class_counts
+                self.covariance_ = xp.sum(
+                    xp.reshape(weights, (-1, 1, 1)) * class_scatter, axis=0
+                )
+            else:
+                # Empirical priors: the pooled factorization is exact.
+                SVt = xp.expand_dims(self._unscaled_S, axis=1) * self._unscaled_Vt
+                self.covariance_ = (SVt.T @ SVt) / N_total
 
         self._n_features_out = self._max_components
         self._svd_attrs_stale = False
@@ -885,8 +919,7 @@ class LinearDiscriminantAnalysis(
         # --- Initialize streaming state ---
         if first_call or not hasattr(self, "_unscaled_S"):
             self._clear_prediction_attrs()
-            self._array_ns = xp
-            self._array_device = dev
+            self._reset_streaming_state()
             self._class_counts = xp.zeros(n_classes, dtype=xp.float64, device=dev)
             self.means_ = xp.zeros(
                 (n_classes, n_features), dtype=xp.float64, device=dev
@@ -896,6 +929,19 @@ class LinearDiscriminantAnalysis(
                 (0, n_features), dtype=xp.float64, device=dev
             )
             self._within_sum_sq = xp.zeros(n_features, dtype=xp.float64, device=dev)
+            # With custom priors the prior-weighted covariance sum_k
+            # prior_k * S_k / N_k cannot be recovered from the pooled
+            # factorization, so accumulate per-class scatter matrices for
+            # covariance_ reconstruction. Gated so that default-priors users
+            # do not pay the O(n_classes * n_features^2) memory cost.
+            if self.store_covariance and self.priors is not None:
+                self._class_scatter = xp.zeros(
+                    (n_classes, n_features, n_features),
+                    dtype=xp.float64,
+                    device=dev,
+                )
+            else:
+                self._class_scatter = None
 
         # --- Per-chunk: compute local stats ---
         chunk_means = xp.zeros(
@@ -913,6 +959,19 @@ class LinearDiscriminantAnalysis(
                 chunk_means[idx] = xp.mean(Xg, axis=0)
                 chunk_counts[idx] = m_k
                 chunk_sum_sq[idx] = xp.sum((Xg - chunk_means[idx]) ** 2, axis=0)
+                if self._class_scatter is not None:
+                    # Chan's update on the full per-class scatter matrix.
+                    # Uses the pre-update class mean, like the vector
+                    # accumulators below.
+                    Xc_k = xp.astype(Xg, xp.float64) - chunk_means[idx]
+                    N_old = float(self._class_counts[idx])
+                    delta = chunk_means[idx] - self.means_[idx]
+                    outer = xp.expand_dims(delta, axis=1) * xp.expand_dims(
+                        delta, axis=0
+                    )
+                    self._class_scatter[idx] = self._class_scatter[idx] + (
+                        Xc_k.T @ Xc_k + (N_old * m_k / (N_old + m_k)) * outer
+                    )
 
         # --- Compute mean-shift correction vectors (parallel axis theorem) ---
         mean_shift_rows = []
@@ -1118,6 +1177,10 @@ class LinearDiscriminantAnalysis(
         X, y = validate_data(
             self, X, y, ensure_min_samples=2, dtype=[xp.float64, xp.float32]
         )
+        # Discard any partial_fit accumulators: fit always starts from
+        # scratch, and stale streaming state must not survive it (a lazy
+        # attribute probe could otherwise rebuild the model from it).
+        self._reset_streaming_state()
         self.classes_ = unique_labels(y)
         n_samples, n_features = X.shape
         n_classes = self.classes_.shape[0]
@@ -1236,6 +1299,12 @@ class LinearDiscriminantAnalysis(
         within-class covariance matrix is reconstructed from the compact
         SVD factorization at prediction time.
 
+        When ``priors`` is given, per-class scatter matrices of shape
+        ``(n_classes, n_features, n_features)`` are additionally
+        accumulated (for the ``svd`` solver only when
+        ``store_covariance=True``) so that the prior-weighted covariance
+        matches ``fit`` exactly.
+
         References
         ----------
         .. [1] T. F. Chan, G. H. Golub, and R. J. LeVeque, "Updating formulae
@@ -1347,11 +1416,23 @@ class LinearDiscriminantAnalysis(
             # Reinitialize accumulators on first call or after a prior
             # fit() call which does not set these private attributes.
             self._clear_prediction_attrs()
+            self._reset_streaming_state()
             self._class_counts = np.zeros(n_classes, dtype=np.float64)
             self.means_ = np.zeros((n_classes, n_features), dtype=np.float64)
             self._unscaled_covariance = np.zeros(
                 (n_features, n_features), dtype=np.float64
             )
+            # With custom priors, the batch covariance sum_k prior_k * S_k
+            # / N_k cannot be folded into a single pooled matrix (the
+            # weights depend on the final class counts), so accumulate
+            # per-class scatter. Gated so that default-priors users do not
+            # pay the O(n_classes * n_features^2) memory cost.
+            if self.priors is not None:
+                self._class_scatter = np.zeros(
+                    (n_classes, n_features, n_features), dtype=np.float64
+                )
+            else:
+                self._class_scatter = None
 
         # --- Chan's parallel variance update per class ---
         for idx, c in enumerate(self.classes_):
@@ -1371,9 +1452,12 @@ class LinearDiscriminantAnalysis(
             N_k_new = N_k_old + m_k
             delta = chunk_mean - self.means_[idx]
 
-            self._unscaled_covariance += S_chunk + (N_k_old * m_k / N_k_new) * np.outer(
+            scatter_increment = S_chunk + (N_k_old * m_k / N_k_new) * np.outer(
                 delta, delta
             )
+            self._unscaled_covariance += scatter_increment
+            if self._class_scatter is not None:
+                self._class_scatter[idx] += scatter_increment
             self.means_[idx] += (m_k / N_k_new) * delta
             self._class_counts[idx] = N_k_new
 
@@ -1414,7 +1498,15 @@ class LinearDiscriminantAnalysis(
                 )
             self._max_components = self.n_components
 
-        covariance = self._unscaled_covariance / N_total
+        if self._class_scatter is None:
+            # Empirical priors: sum_k (N_k / N) * S_k / N_k == pooled / N.
+            covariance = self._unscaled_covariance / N_total
+        else:
+            # Match the batch _class_cov weighting: sum_k prior_k * S_k / N_k.
+            # All class counts are positive here (solving only happens once
+            # every declared class has been observed).
+            weights = np.asarray(self.priors_, dtype=np.float64) / self._class_counts
+            covariance = np.tensordot(weights, self._class_scatter, axes=1)
 
         # Apply explicit float shrinkage
         if self.shrinkage is not None:
@@ -1423,34 +1515,16 @@ class LinearDiscriminantAnalysis(
         self.covariance_ = covariance
 
         if self.solver == "eigen":
-            # Reconstruct between-class scatter
+            # Derive Sb = St - Sw exactly as the batch path does. St is the
+            # empirical total covariance (unaffected by priors); Sw is the
+            # (possibly prior-weighted, possibly shrunk) covariance above.
             mu_global = np.average(self.means_, axis=0, weights=self._class_counts)
-            Sb = (
-                sum(
-                    self._class_counts[i]
-                    * np.outer(self.means_[i] - mu_global, self.means_[i] - mu_global)
-                    for i in range(n_classes)
-                )
-                / N_total
-            )
-
+            centered_means = self.means_ - mu_global
+            between_scatter = (centered_means.T * self._class_counts) @ centered_means
+            St = (self._unscaled_covariance + between_scatter) / N_total
             if self.shrinkage is not None:
-                St = shrunk_covariance(
-                    (
-                        self._unscaled_covariance
-                        + sum(
-                            self._class_counts[i]
-                            * np.outer(
-                                self.means_[i] - mu_global,
-                                self.means_[i] - mu_global,
-                            )
-                            for i in range(n_classes)
-                        )
-                    )
-                    / N_total,
-                    self.shrinkage,
-                )
-                Sb = St - covariance
+                St = shrunk_covariance(St, self.shrinkage)
+            Sb = St - covariance
 
             self._solve_eigen_from_matrices(Sb=Sb, Sw=covariance)
         elif self.solver == "lsqr":

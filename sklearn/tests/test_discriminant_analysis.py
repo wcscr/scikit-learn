@@ -1113,13 +1113,190 @@ def test_lda_partial_fit_honors_priors(solver):
     clf_no_priors = LinearDiscriminantAnalysis(solver=solver)
     clf_no_priors.partial_fit(X_full, y_full, classes=classes)
 
+    clf_batch = LinearDiscriminantAnalysis(solver=solver, priors=explicit_priors)
+    clf_batch.fit(X_full, y_full)
+
     assert_allclose(clf_priors.priors_, explicit_priors, atol=1e-10)
+    # partial_fit with priors must match batch fit with the same priors
+    assert_allclose(clf_priors.coef_, clf_batch.coef_, atol=1e-5)
+    assert_allclose(clf_priors.intercept_, clf_batch.intercept_, atol=1e-5)
     # intercept_ should differ when priors differ
     assert not np.allclose(
         clf_priors.intercept_,
         clf_no_priors.intercept_,
         atol=1e-5,
     )
+
+
+@pytest.mark.parametrize(
+    "solver, shrinkage",
+    [("eigen", None), ("eigen", 0.3), ("lsqr", None), ("lsqr", 0.3), ("svd", None)],
+)
+@pytest.mark.parametrize("n_classes", [2, 3])
+def test_lda_partial_fit_custom_priors_batch_equivalence(solver, shrinkage, n_classes):
+    """partial_fit with custom priors != class frequencies must match fit.
+
+    Non-regression test: the streaming covariance used empirical count
+    weighting regardless of the priors, diverging from the batch
+    prior-weighted covariance sum_k prior_k * S_k / N_k.
+    """
+    if n_classes == 2:
+        weights, priors = [0.75, 0.25], [0.5, 0.5]
+    else:
+        weights, priors = [0.6, 0.3, 0.1], [0.2, 0.3, 0.5]
+    X_full, y_full = make_classification(
+        n_samples=400,
+        n_features=5,
+        n_informative=5,
+        n_redundant=0,
+        n_classes=n_classes,
+        weights=weights,
+        random_state=0,
+    )
+    store_covariance = solver == "svd"
+
+    clf_batch = LinearDiscriminantAnalysis(
+        solver=solver,
+        shrinkage=shrinkage,
+        priors=priors,
+        store_covariance=store_covariance,
+    )
+    clf_batch.fit(X_full, y_full)
+
+    clf_online = LinearDiscriminantAnalysis(
+        solver=solver,
+        shrinkage=shrinkage,
+        priors=priors,
+        store_covariance=store_covariance,
+    )
+    classes = np.unique(y_full)
+    chunk_size = 64
+    for i in range(0, len(X_full), chunk_size):
+        clf_online.partial_fit(
+            X_full[i : i + chunk_size],
+            y_full[i : i + chunk_size],
+            classes=classes if i == 0 else None,
+        )
+
+    assert_allclose(clf_online.coef_, clf_batch.coef_, atol=1e-5)
+    assert_allclose(clf_online.intercept_, clf_batch.intercept_, atol=1e-5)
+    assert_allclose(clf_online.covariance_, clf_batch.covariance_, atol=1e-7)
+    assert_array_equal(clf_online.predict(X_full), clf_batch.predict(X_full))
+    assert_allclose(
+        clf_online.predict_proba(X_full),
+        clf_batch.predict_proba(X_full),
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("solver", ["eigen", "lsqr"])
+def test_lda_partial_fit_priors_equal_empirical_matches_default(solver):
+    """Explicit priors equal to class frequencies must reproduce priors=None."""
+    X_full, y_full = make_classification(
+        n_samples=400,
+        n_features=5,
+        n_informative=5,
+        n_redundant=0,
+        n_classes=2,
+        weights=[0.7, 0.3],
+        random_state=3,
+    )
+    empirical = np.bincount(y_full) / len(y_full)
+    classes = np.unique(y_full)
+
+    clf_explicit = LinearDiscriminantAnalysis(solver=solver, priors=empirical)
+    clf_default = LinearDiscriminantAnalysis(solver=solver)
+    for clf in (clf_explicit, clf_default):
+        for i in range(0, len(X_full), 64):
+            clf.partial_fit(
+                X_full[i : i + 64],
+                y_full[i : i + 64],
+                classes=classes if i == 0 else None,
+            )
+
+    assert_allclose(clf_explicit.covariance_, clf_default.covariance_, atol=1e-10)
+    assert_allclose(clf_explicit.coef_, clf_default.coef_, atol=1e-8)
+
+
+@pytest.mark.parametrize("solver", ["eigen", "lsqr", "svd"])
+@pytest.mark.parametrize("reconstructed", [False, True])
+def test_lda_partial_fit_pickle_deepcopy(solver, reconstructed):
+    """Streaming models must survive pickle and deepcopy roundtrips.
+
+    Non-regression test: the SVD streaming state used to hold an array
+    namespace module reference, making the estimator unpicklable.
+    """
+    import copy
+    import pickle
+
+    X_full, y_full = make_classification(
+        n_samples=100,
+        n_features=4,
+        n_informative=4,
+        n_redundant=0,
+        n_classes=2,
+        random_state=0,
+    )
+    classes = np.unique(y_full)
+
+    clf = LinearDiscriminantAnalysis(solver=solver)
+    clf.partial_fit(X_full[:50], y_full[:50], classes=classes)
+    clf.partial_fit(X_full[50:], y_full[50:])
+    if reconstructed:
+        clf.predict(X_full)  # force lazy attribute reconstruction (svd)
+
+    clf_pickled = pickle.loads(pickle.dumps(clf))
+    clf_copied = copy.deepcopy(clf)
+
+    expected = clf.predict(X_full)
+    assert_array_equal(clf_pickled.predict(X_full), expected)
+    assert_array_equal(clf_copied.predict(X_full), expected)
+
+    # Roundtripped estimators must keep accepting new chunks
+    clf_pickled.partial_fit(X_full[:10], y_full[:10])
+    assert clf_pickled.predict(X_full).shape == y_full.shape
+
+
+def test_lda_fit_after_partial_fit_no_stale_reconstruction():
+    """fit() after partial_fit() must clear leftover streaming state.
+
+    Non-regression test: a stale lazy-reconstruction flag surviving fit()
+    meant that a simple attribute probe (e.g. hasattr(clf, "covariance_"))
+    silently rebuilt coef_ from the discarded streaming accumulators.
+    """
+    X_a, y_a = make_classification(
+        n_samples=200,
+        n_features=4,
+        n_informative=4,
+        n_redundant=0,
+        n_classes=2,
+        random_state=1,
+    )
+    X_b, y_b = make_classification(
+        n_samples=200,
+        n_features=4,
+        n_informative=4,
+        n_redundant=0,
+        n_classes=2,
+        random_state=2,
+        shift=3.0,
+        scale=2.0,
+    )
+
+    clf = LinearDiscriminantAnalysis(solver="svd")
+    clf.partial_fit(X_a, y_a, classes=np.unique(y_a))
+    clf.fit(X_b, y_b)
+
+    assert clf.__dict__.get("_svd_attrs_stale", False) is False
+    coef_before = clf.coef_.copy()
+    # store_covariance=False: probing covariance_ must neither succeed nor
+    # rebuild anything.
+    assert not hasattr(clf, "covariance_")
+    assert_array_equal(clf.coef_, coef_before)
+
+    clf_fresh = LinearDiscriminantAnalysis(solver="svd").fit(X_b, y_b)
+    assert_array_equal(clf.predict(X_b), clf_fresh.predict(X_b))
+    assert_allclose(clf.coef_, clf_fresh.coef_, atol=1e-12)
 
 
 @pytest.mark.parametrize("solver", ["lsqr", "svd"])
